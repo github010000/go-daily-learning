@@ -3,110 +3,139 @@ package main
 import (
 	"fmt"
 	"runtime"
-	"runtime/pprof"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-const localRunQueueSize = 256
+const (
+	// cpuLoad 는 CPU-bound 작업 반복 횟수다.
+	// main 시연에서는 GOMAXPROCS 변화를 볼 수 있을 만큼 크게 잡고,
+	// 테스트에서는 시간이 오래 걸리지 않도록 더 작은 값을 직접 넘긴다.
+	cpuLoad = 1 << 24
 
-// osThreadCount는 Go 런타임이 지금까지 만든 OS 스레드(M) 수를 근사해서 돌려준다.
-// runtime/pprof의 threadcreate 프로파일은 스레드가 새로 생길 때마다 1씩 증가하므로
-// 방향성을 보기에 충분하다. 정확한 현재 M 수는 런타임 내부에만 있지만 관찰 목적으로는
-// 이 값이면 된다.
-func osThreadCount() int {
-	p := pprof.Lookup("threadcreate")
-	if p == nil {
-		return -1
+	// demoWorkers 는 시연용 goroutine 개수다. P보다 많게 두어
+	// 로컬 런큐에 실행을 기다리는 G가 생기는 상황을 만든다.
+	demoWorkers = 16
+)
+
+// cpuBound 는 CPU 연산만으로 시간을 소모해 GOMAXPROCS 변화를 관찰하기 위한 함수다.
+// 반환값을 호출부에서 사용하도록 해 컴파일러가 루프를 제거하지 못하게 한다.
+// 같은 입력에는 항상 같은 결과를 내므로 테스트에서 결정적으로 검증할 수 있다.
+func cpuBound(workerID, iterations int) uint64 {
+	var sum uint64
+	for i := 0; i < iterations; i++ {
+		sum += uint64(i)
 	}
-	return p.Count()
+	// workerID를 더해 각 goroutine이 자기 몫을 계산했는지 테스트에서 확인 가능하게 한다.
+	return sum + uint64(workerID)
 }
 
-// cpuBurn은 관찰을 위해 CPU를 일정 시간 태우는 함수다.
-// 단순 덧셈 반복문은 컴파일러가 없애려고 할 수 있으므로 조건문을 넣어
-// 실제 계산이 일어나도록 강제한다.
-func cpuBurn(n int64) {
-	var sum int64
-	for i := int64(0); i < n; i++ {
-		sum += i
+// runParallel 은 workers 개수만큼 goroutine을 생성해 CPU-bound 작업을 동시에 수행한다.
+// 각 goroutine은 results 슬라이스의 서로 다른 인덱스에만 쓴다.
+// 따라서 -race 로 돌려도 데이터 경쟁이 없다.
+func runParallel(workers, iterations int) []uint64 {
+	results := make([]uint64, workers)
+	var wg sync.WaitGroup
+	wg.Add(workers)
+
+	for wid := 0; wid < workers; wid++ {
+		go func(id int) {
+			defer wg.Done()
+			// id는 고유하므로 results[id]는 이 goroutine만 쓴다.
+			results[id] = cpuBound(id, iterations)
+		}(wid)
 	}
-	if sum < 0 {
-		println(sum)
+
+	wg.Wait()
+	return results
+}
+
+// measureParallelism 은 GOMAXPROCS 를 p 로 바꾼 뒤 CPU-bound 작업 시간을 측정한다.
+// 측정이 끝나면 원래 GOMAXPROCS 로 되돌려 다른 시연 순서에 영향을 주지 않는다.
+// P 개수가 GMP 모델에서 동시에 실행될 수 있는 M 개수를 제한하는 모습을 보여준다.
+func measureParallelism(workers, iterations, p int) ([]uint64, time.Duration, int) {
+	old := runtime.GOMAXPROCS(p)
+	start := time.Now()
+	results := runParallel(workers, iterations)
+	elapsed := time.Since(start)
+	runtime.GOMAXPROCS(old)
+	return results, elapsed, p
+}
+
+// printSchedulerStatus 는 G/M/P 모델 중 코드에서 직접 관찰 가능한 지표를 출력한다.
+// NumCPU는 물리/논리 코어 수, GOMAXPROCS는 P 개수, NumGoroutine은 현재 G 개수다.
+func printSchedulerStatus() {
+	fmt.Printf("NumCPU=%d\n", runtime.NumCPU())
+	fmt.Printf("GOMAXPROCS=%d\n", runtime.GOMAXPROCS(0))
+	fmt.Printf("NumGoroutine=%d\n", runtime.NumGoroutine())
+}
+
+// demonstrateCurrentP 는 실행 시점의 GOMAXPROCS 를 바꾸지 않고 그대로 사용한다.
+// GOMAXPROCS=1 go run . 과 GOMAXPROCS=4 go run . 을 비교할 때
+// 이 첫 시연의 elapsed 차이가 가장 직접적인 증거가 된다.
+func demonstrateCurrentP() {
+	start := time.Now()
+	results := runParallel(demoWorkers, cpuLoad)
+	elapsed := time.Since(start)
+	fmt.Printf("현재 GOMAXPROCS=%d  workers=%d  elapsed=%v  firstResult=%d\n",
+		runtime.GOMAXPROCS(0), demoWorkers, elapsed, results[0])
+}
+
+// demonstrateScaling 은 같은 개수의 goroutine이라도 P 개수에 따라 CPU-bound 작업
+// 완료 시간이 어떻게 달라지는지 보여준다.
+// P 가 1 이면 모든 goroutine이 한 OS 스레드에서 순차 실행된다.
+// P 를 2, 4, NumCPU 로 늘리면 동시에 실행될 수 있는 M 이 늘어나 elapsed 가 줄어든다.
+func demonstrateScaling() {
+	fmt.Println("--- 같은 goroutine 16개, P 개수에 따른 CPU-bound 처리 시간 ---")
+	for _, p := range []int{1, 2, 4, runtime.NumCPU()} {
+		// 물리 CPU 개수보다 많은 P는 비교 의미가 없으므로 건너뛴다.
+		if p > runtime.NumCPU() {
+			continue
+		}
+		results, elapsed, usedP := measureParallelism(demoWorkers, cpuLoad, p)
+		// 결과가 0이 아니어야 실제 계산이 수행된 것이다.
+		// firstResult를 출력해 컴파일러가 루프를 최적화로 없애지 않았음을 함께 보여준다.
+		fmt.Printf("GOMAXPROCS=%2d  workers=%d  elapsed=%8v  firstResult=%d\n",
+			usedP, demoWorkers, elapsed, results[0])
 	}
+}
+
+// cooperativeYieldWorkers 는 runtime.Gosched 를 호출하며 1000회씩 카운터를 증가시킨다.
+// Gosched 는 현재 G 가 자발적으로 P 를 내놓아 로컬 런큐의 다른 G 가 실행되게 한다.
+// 카운터는 atomic으로 증가시키므로 -race 에서도 안전하다.
+func cooperativeYieldWorkers(workers int) int {
+	var counter atomic.Int32
+	var wg sync.WaitGroup
+	wg.Add(workers)
+
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 1000; j++ {
+				// 현재 G를 P의 로컬 런큐에 양보하고 스케줄러를 다시 호출한다.
+				runtime.Gosched()
+				counter.Add(1)
+			}
+		}()
+	}
+
+	wg.Wait()
+	return int(counter.Load())
 }
 
 func main() {
-	fmt.Println("== GMP 모델 관찰 시작 ==")
-	fmt.Printf("NumCPU: %d\n", runtime.NumCPU())
-	fmt.Printf("초기 P(GOMAXPROCS): %d\n", runtime.GOMAXPROCS(0))
-	fmt.Printf("초기 G(NumGoroutine): %d\n", runtime.NumGoroutine())
-	fmt.Printf("초기 M(thread create profile count): %d\n", osThreadCount())
+	printSchedulerStatus()
+	fmt.Println()
 
-	procsBefore := runtime.GOMAXPROCS(0)
+	fmt.Println("--- 현재 GOMAXPROCS를 그대로 사용하는 시연 ---")
+	demonstrateCurrentP()
 
-	// 지역 run queue와 글로벌 run queue의 관계를 보기 위해 P를 1개로 제한한다.
-	// 이렇게 하면 main goroutine이 만드는 300개 G가 모두 같은 P에 쌓인다.
-	runtime.GOMAXPROCS(1)
-	fmt.Println("\n-- GOMAXPROCS=1에서 300개 goroutine 생성 순서 기록 --")
+	fmt.Println()
+	demonstrateScaling()
 
-	const n = 300
-	var counter int64
-	startOrder := make([]int64, n)
-	var wg sync.WaitGroup
-	wg.Add(n)
+	fmt.Printf("\nGosched 로 협조적으로 양보한 횟수: %d\n", cooperativeYieldWorkers(4))
 
-	// 각 goroutine은 생성 순서 id를 받고, 실제 실행되는 순서를 atomic으로 기록한다.
-	// GOMAXPROCS=1이므로 한 번에 하나씩만 실행된다.
-	for i := 0; i < n; i++ {
-		go func(id int) {
-			defer wg.Done()
-			seq := atomic.AddInt64(&counter, 1)
-			atomic.StoreInt64(&startOrder[id], seq)
-		}(i)
-	}
-
-	fmt.Printf("생성 직후 G count: %d\n", runtime.NumGoroutine())
-	wg.Wait()
-	fmt.Printf("완료 후 G count: %d\n", runtime.NumGoroutine())
-
-	// 위에서 300개 G를 만들었을 때 런타임은 마지막에 만든 G를 runnext에 넣고,
-	// 지역 runq가 256개로 가득 차면 절반을 global runq로 보낸다.
-	// 따라서 실행 순서는 생성 순서와 다르다. 아래 숫자가 그 증거가 된다.
-	fmt.Println("\n선택된 생성 index의 실행 순서:")
-	selected := []int{299, 128, 255, 257, 0, 127, 256}
-	for _, idx := range selected {
-		fmt.Printf("생성 index %3d -> 실행 순서 %3d\n", idx, atomic.LoadInt64(&startOrder[idx]))
-	}
-	fmt.Println("runnext(LIFO), 지역 runq(256), global runq(절반 이동)의 효과가 드러난다.")
-
-	// 이제 P를 2개로 늘려 병렬 실행이 실제로 M(OS thread)을 늘리는지 확인한다.
-	// P는 실행 슬롯이고 M은 그 슬롯을 실제로 돌리는 OS 스레드다.
-	if procsBefore >= 2 {
-		runtime.GOMAXPROCS(2)
-	} else {
-		runtime.GOMAXPROCS(1)
-	}
-	fmt.Println("\n-- 병렬 CPU 버스트 실행 --")
-	fmt.Printf("현재 P(GOMAXPROCS): %d\n", runtime.GOMAXPROCS(0))
-	fmt.Printf("버스트 직전 M(thread create profile count): %d\n", osThreadCount())
-
-	start := time.Now()
-	var wg2 sync.WaitGroup
-	wg2.Add(2)
-	for j := 0; j < 2; j++ {
-		go func() {
-			defer wg2.Done()
-			cpuBurn(300_000_000)
-		}()
-	}
-	wg2.Wait()
-	elapsed := time.Since(start)
-
-	fmt.Printf("CPU 버스트 완료 시간: %v\n", elapsed)
-	fmt.Printf("버스트 직후 M(thread create profile count): %d\n", osThreadCount())
-	fmt.Println("M이 늘어났다면 P가 2개이므로 2개의 G를 병렬로 돌리기 위해 새 M을 만들었기 때문이다.")
-
-	runtime.GOMAXPROCS(procsBefore)
-	fmt.Printf("\nGOMAXPROCS 복원: %d\n", procsBefore)
+	// GODEBUG=schedtrace=1000 go run . 처럼 실행하면 M/P/G 상태가 주기적으로 출력된다.
+	// 이 코드에서는 그 출력을 직접 만들지 않고 위 명령으로 확인하도록 README 에 안내한다.
 }
