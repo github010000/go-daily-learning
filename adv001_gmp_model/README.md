@@ -1,61 +1,88 @@
 ## 한 줄 요약
 
-Go runtime scheduler는 G(goroutine), M(OS thread), P(logical processor)의 3층 구조를 쓴다. G는 실행 흐름, M은 실제 OS 스레드, P는 scheduler context이자 지역 run queue를 가진 실행 슬롯이다. P를 G와 M 사이에 끼워 넣어 전역 run queue 경합을 줄이고, OS 스레드 수를 GOMAXPROCS 단위로 제한하면서, syscall 중에도 실행 자원을 안전하게 넘길 수 있게 만들었다.
+Go 런타임의 GMP 모델은 goroutine(G), OS 스레드(M), logical processor(P)를 분리해 스케줄링 상태와 실행 수단을 떼어놓는다. P는 로컬 런큐와 메모리 캐시를 보유한 자원 자격증 역할을 하며, 같은 개수의 G라도 P가 몇 개인지에 따라 실제 병렬성이 결정된다.
 
 ## 왜 이런 설계인가
 
-Go가 처음 나온 시절에는 오늘날 같은 GMP 구조가 없었다. 초기 Go scheduler는 G와 M만 있었고, 실행 가능한 G는 모두 하나의 global run queue에 보관됐다. 그 큐는 mutex로 보호됐는데, CPU 코어가 늘어나고 goroutine 수가 많아지면 모든 M이 같은 큐에서 G를 꺼내려고 경합했다. 특히 CPU-bound goroutine 수천 개가 동시에 돌면 mutex contention이 치솟았고, G를 꺼내는 시간이 실제 작업 시간보다 커지는 경우도 있었다. 사용자 입장에서는 goroutine이 아무리 가벼워도 scheduler가 bottleneck이 되면 아무 의미가 없었다.
+Go 1.1 이전 스케줄러는 G와 M만 있었고 모든 실행 대기 goroutine을 하나의 글로벌 런큐에 넣었다. 스케줄링할 때마다 전역 뮤텍스를 잡아야 했기 때문에 goroutine 수가 늘어나면 락 경합이 처리량을 갉아먹었다. CPU 코어가 몇 개이든 관계없이 글로벌 큐 하나를 두고 싸우는 구조는 멀티코어 확장성이 거의 없었다.
 
-두 번째 문제는 thread explosion이었다. M은 OS thread이므로 syscall에서 blocking되면 그 M은 한동안 아무것도 하지 못한다. 초기 구조에서는 M이 syscall에 들어가면 그 M에 붙어 있던 G도 전부 멈춰 보였고, 이를 만회하려고 런타임이 새 M을 계속 만들었다. 명시적인 상한이 없었기 때문에 blocking syscall이 많은 서버는 OS thread가 수백 개, 수천 개로 늘어났고, 커널 스택과 context switch 비용이 급증했다. 이는 goroutine을 가볍게 쓰려는 Go의 핵심 가치를 훼손하는 지점이었다.
+G와 M을 직접 묶는 대안도 문제가 있었다. goroutine 하나에 OS 스레드 하나를 할당하면 스택과 스레드 생성 비용 때문에 Go의 장점이 사라진다. 반대로 여러 G를 하나의 M에 멀티플렉싱하려면 대기 중인 G를 어딘가에 줄 세워야 하는데, 그 줄을 글로벌 런큐 하나로 만들면 다시 락 경합이 생긴다. 차라리 M마다 로컬 큐를 주고 필요할 때만 글로벌 큐를 쓰게 하는 것이 낫다.
 
-Go 1.1에서 P를 도입한 이유가 여기에 있다. P는 M과 분리된 scheduler context로서 지역 run queue와 runnext slot, 상태, 통계를 가진다. GOMAXPROCS는 P의 개수를 의미하고, P 하나가 곧 동시에 실행될 수 있는 G 하나의 슬롯이다. M이 blocking syscall에 들어가면 P가 그 M에서 떨어져 idle P pool로 이동하고, 다른 M이 그 P를 acquirep하여 남은 G를 계속 실행한다. 이렇게 하면 M의 수는 동적이되 P의 수는 고정되어, OS thread가 무한정 늘어나는 것을 막으면서도 syscall 중에 실행 자원이 방치되지 않는다.
+P는 그 로컬 큐를 소유하는 존재로 등장했다. P는 M이 Go 코드를 실행하려면 반드시 붙잡고 있어야 하는 자격이다. goroutine이 blocking syscall에 들어가면 해당 M은 커널에서 멈추지만, P는 그 M으로부터 떼어져 다른 M에 붙는다. 이렇게 하면 blocking syscall 때문에 CPU가 쉬지 않고, 동시에 Go 코드를 실행하는 M 개수는 GOMAXPROCS로 제한된다. OS 스레드는 필요할 때 더 생길 수 있지만, 실제로 Go 코드를 돌리는 스레드 수는 P 개수를 넘지 않는다.
 
-P를 굳이 M에 직접 묶지 않고 분리한 이유는 M이 오래 block되거나 park될 수 있기 때문이다. 만약 지역 run queue를 M에 묶었다면 M이 syscall에 들어가는 순간 그 큐에 있던 G는 모두 멈춰야 하고, M이 돌아올 때까지 실행 기회를 잃는다. P는 이런 OS 자원의 불확실성에서 queue를 보호하는 계층이다. 어떤 의미에서 P는 core를 쓸 자격을 나타내고, M은 그 자격을 실제로 실행하는 수단이다. 이 3층 분리가 없으면 G와 M을 직접 묶으면서 생기는 캐시 지역성 저하와 thread 관리를 동시에 해결하기 어렵다.
+P 하나에는 크기가 256인 로컬 런큐와 runnext 슬롯이 있다. 로컬 큐가 가득 차면 절반을 글로벌 런큐로 넘기고, 로컬 큐가 비면 다른 P의 로컬 큐에서 절반을 훔쳐 온다. 이렇게 하면 전역 락을 자주 잡지 않고도 작업 분배가 된다. runnext는 채널에서 깨어난 goroutine처럼 방금 대기가 풀린 G를 즉시 다음 실행 후보로 넣어 캐시 지역성을 높이는 장치다.
 
 ## 어떻게 동작하는가
 
-핵심 자료구조는 `src/runtime/runtime2.go`에 정의돼 있다. `type g struct`는 stack, sched 정보, atomicstatus, lockedm 등을 가진다. `type m struct`는 `p *p`, `nextp`, `oldp`, `schedlink`, `mcache` 등을 가진다. `type p struct`는 지역 run queue 관련 필드를 직접 보유하는데, `runq [256]guintptr`, `runnext guintptr`, `runqhead uint32`, `runqtail uint32`가 대표적이다. 전역 run queue는 같은 파일의 `schedt` 구조체에 `runqhead`, `runqtail`, `runqsize`로 존재하며 `sched`라는 전역 변수로 관리된다. 이 필드 이름이 실제 코드에 그대로 등장한다.
+`runtime/runtime2.go`를 보면 G, M, P가 각각 struct로 정의되어 있다. G는 `stack`, `sched`, `goid`, `atomicstatus`를 가진다. `sched`는 gobuf로 sp, pc, ret 같은 실행 재개 정보를 담는다. G의 상태는 `_Gidle`, `_Grunnable`, `_Grunning`, `_Gsyscall`, `_Gwaiting`, `_Gdead` 등으로 나뉜다. runnable 상태의 G는 어떤 P의 로컬 런큐나 글로벌 런큐에서 실행 차례를 기다린다.
 
-P의 지역 run queue는 크기가 256으로 고정된 circular array다. `src/runtime/proc.go`의 `runqput` 함수는 새 G를 지역 run queue에 넣을 때 먼저 `runnext` slot에 넣는다. `runnext`는 LIFO로 동작하는 1칸 slot인데, 방금 만든 goroutine이 같은 데이터를 다시 쓰는 캐시 친화적 패턴을 활용하기 위해 존재한다. 이미 `runnext`에 G가 있다면 기존 G는 지역 run queue tail로 밀려난다. 지역 run queue가 256개로 가득 찼다면 `runqputslow`가 호출된다. `runqputslow`는 runq의 앞쪽 절반인 128개와 밀려난 G 하나를 묶어 batch로 만들고 `lock(&sched.lock)`을 잡은 뒤 `globrunqputbatch`로 전역 run queue에 넣는다. 그 다음 head를 128 증가시켜 지역 run queue에는 128개만 남긴다.
+M은 OS 스레드를 감싼다. struct m에는 `g0`, `curg`, `p`, `mOS` 필드가 있다. `g0`는 사용자 코드가 아니라 스케줄러 자체가 쓰는 특수 goroutine이다. `curg`는 이 M이 현재 실행 중인 사용자 G를 가리킨다. M은 `p` 필드로 P를 참조하며, P 없이는 Go 코드를 실행하지 못한다. goroutine이 syscall에 들어가면 `runtime/proc.go`의 `entersyscall`이 P를 `_Psyscall` 상태로 만들고, sysmon이 오래 멈춰 있다고 판단하면 P를 빼앗아 다른 M에게 준다.
 
-이렇게 절반만 전역으로 보내는 이유는 한 P가 너무 많은 G를 독점하지 않게 하면서도, 완전히 지역성을 잃지 않게 하려는 절충이다. 전역 run queue는 모든 P가 공유하므로 크기가 커질수록 mutex 경합과 cache miss가 늘어난다. 반면 지역 run queue가 비어 있는 P는 `findrunnable`에서 `globrunqget`으로 전역 큐를 확인하거나, 다른 P의 지역 run queue에서 `runqsteal`로 절반을 훔쳐 온다. `runqsteal`도 절반만 가져오는 것은 victim P가 계속할 수 있게 남겨 두기 위한 균형이다.
+P는 struct p에 `runq [256]guintptr`, `runqhead`, `runqtail`, `runnext`, `mcache`, `status`를 가진다. runq는 원형 배열처럼 head와 tail로 관리한다. 크기가 256인 이유는 캐시 라인 몇 개 안에 들어가면서도 전역 락을 자주 쓰지 않을 만큼은 길게 가져가기 위한 절충이다. `runnext`는 runq보다 먼저 확인하는 단일 슬롯이다. `mcache`는 P 전용 할당 캐시라서 같은 P에서 도는 goroutine들이 메모리를 인접하게 쓰게 만든다.
 
-P는 고정된 상태 기계를 가진다. `_Pidle`, `_Prunning`, `_Psyscall`, `_Pgcstop`, `_Pdead`가 대표적이다. M이 syscall에 들어가면 `reentersyscall`이 P를 `_Psyscall`로 바꾸고, syscall이 blocking이라면 P를 idle pool로 반환한다. syscall에서 돌아온 M은 `exitsyscall`에서 다시 P를 얻으려 시도하고, 없으면 M을 park한다. 이 흐름이 M 증가를 제한하면서 P를 계속 활용하는 핵심이다. `schedule`은 이 state transition을 계속 돌면서 G를 실행한다.
+`runtime/proc.go`의 `schedule` 함수는 스케줄링 한 사이클의 중심이다. 현재 P의 `runnext`를 확인하고, 비어 있으면 `runqget`으로 로컬 런큐에서 꺼낸다. 로컬이 비면 `globrunqget`으로 글로벌 큐를 보고, 계속 비어 있으면 `findrunnable`에서 다른 P의 로컬 런큐를 `runqsteal`로 훔친다. 훔칠 때는 절반 정도를 가져와서 한쪽 P만 바쁘고 다른 P는 빈 채로 도는 불균형을 줄인다.
+
+GOMAXPROCS를 바꾸면 `procresize`가 P 개수를 조정한다. P가 1이면 수백 개의 goroutine이 있어도 Go 코드를 동시에 실행하는 M은 하나뿐이다. P를 늘리면 그만큼 M이 병렬로 Go 코드를 실행할 수 있다. 그러나 P가 늘어날수록 mcache와 로컬 런큐도 늘고 work stealing 시도도 많아진다. 물리 코어 수를 넘어서 P를 늘리면 parallel speedup은 없고 컨텍스트 스위칭 오버헤드만 늘어난다.
+
+이 구조는 `runtime.Gosched`를 쓰는 협조적 양보에서도 드러난다. Gosched를 호출하면 현재 G를 자기 P의 로컬 런큐에 넣고 `mcall(gosched_m)`을 타고 다시 스케줄러로 돌아간다. 이후 같은 P의 runnext나 runq에 있던 다른 G가 실행된다. main.go의 `cooperativeYieldWorkers`는 이 양보가 실제로 카운터를 몇 번 올리는지 보여준다.
+
+## 돌려보기
+
+이 디렉토리에서 아래 명령을 순서대로 실행하면 된다.
+
+```bash
+go vet ./...                 # 정적 검사
+go build -o /dev/null ./...  # 컴파일 확인
+go run .                     # 시연 실행
+GODEBUG=schedtrace=1000 GOMAXPROCS=2 go run .  # 스케줄러 내부 상태 로그
+GOMAXPROCS=1 go run .        # P 1개로 실행
+go test -v ./...             # 테스트
+go test -race ./...          # 동시성 race 검사
+go test -bench=. -benchmem ./...  # 벤치마크
+```
+
+`go vet ./...`는 코드에 복사된 락이나 의심스러운 동시성 패턴이 있는지 확인한다. 통과하면 정적 검사 결과가 없다는 뜻이다. `go build -o /dev/null ./...`는 main.go와 main_test.go가 함께 컴파일되는지 확인한다.
+
+`go run .`은 처음에 `NumCPU`, `GOMAXPROCS`, `NumGoroutine`을 출력한 뒤, 현재 P를 그대로 사용하는 실행 시간과 P를 1, 2, 4, NumCPU로 바꿔가며 잰 실행 시간을 표로 보여준다. P가 1에서 2, 4로 늘어날수록 elapsed가 대략 절반씩 줄어드는지 봐야 한다. CPU-bound 작업이므로 물리 코어 한계까지는 거의 선형에 가깝게 줄어든다.
+
+`GODEBUG=schedtrace=1000 GOMAXPROCS=2 go run .`는 1초마다 `SCHED` 로그를 출력한다. `gomaxprocs=2`, `idleprocs`, `threads`, `runqueue` 값을 봐야 한다. 이 로그에서 P 개수가 1, 2, 4 등으로 바뀌는 구간과 CPU-bound 작업 중 idleprocs가 0이 되는 구간이 겹친다. `GOMAXPROCS=1 go run .`은 외부 환경변수로 P를 1로 고정한 뒤 첫 시연의 elapsed가 크게 나오는 모습을 보여준다.
+
+`go test -v ./...`는 결정적 계산과 모든 goroutine 완료, 그리고 협조적 양보 횟수를 검증한다. `go test -race ./...`는 runParallel이 서로 다른 슬라이스 인덱스에만 쓰고 atomic 카운터를 쓴다는 점을 race detector로 확인한다. `go test -bench=. -benchmem ./...`는 현재 P 개수에서 runParallel의 반복당 시간과 할당량을 보여준다.
 
 ## 코드로 확인하기
 
-`main.go`는 크게 세 가지를 출력한다. 처음에는 `runtime.GOMAXPROCS(0)`으로 P 수를, `runtime.NumGoroutine()`으로 G 수를, `pprof.Lookup("threadcreate").Count()`로 M 수의 근사치를 보여준다. 보통 초기 상태에서는 P 수가 M 수보다 크다. P는 실행 슬롯이므로 여러 개가 존재하지만, 실제로 OS thread는 G가 병렬로 돌기 전까지는 많이 필요하지 않기 때문이다. 이 시점에서 이미 GMP의 역할 분리를 확인할 수 있다.
+main.go의 `cpuBound`는 0부터 iterations-1까지 더하는 CPU-bound 함수다. 반환값에 workerID를 더해서 호출부가 값을 쓰게 만들었다. 이 반환값이 없으면 컴파일러가 루프를 통째로 제거할 가능성이 있고, 그러면 P 개수에 따른 시간 차이가 사라진다. firstResult가 0이 아닌 값으로 출력된다면 실제 계산이 수행된 것이다.
 
-다음으로 P를 1개로 제한하고 300개의 goroutine을 만든다. 각 goroutine은 생성 index를 받고, 실행 순서를 atomic counter로 기록한다. 주석에도 적었듯이 GOMAXPROCS=1이므로 한 번에 하나의 G만 실행된다. 출력에서 `생성 index 299 -> 실행 순서 1`을 볼 수 있다. 이는 마지막으로 만든 G가 P의 `runnext`에 있기 때문이다. `runqget`은 지역 runq보다 `runnext`를 먼저 꺼내므로 가장 최근에 만든 goroutine이 가장 먼저 실행된다.
+`runParallel`은 16개의 goroutine을 만들고 각자 `cpuBound`를 실행한다. 각 goroutine은 results 슬라이스의 고유한 인덱스에만 쓰기 때문에 `go test -race`에서도 경쟁이 없다. 부모 goroutine은 wg.Wait()로 모든 자식이 끝날 때까지 기다린다. 이 함수는 같은 입력에 같은 결과를 내므로 테스트에서 순차 계산과 비교할 수 있다.
 
-`생성 index 128 -> 실행 순서 2`는 왜 나오는가? 300개를 만들다 보면 지역 runq가 256개로 가득 차는 시점이 온다. 이때 `runqputslow`가 runq의 앞쪽 절반인 0~127을 전역으로 보내고 head가 128로 이동한다. 따라서 지역 runq에 남은 첫 번째 G는 index 128이 된다. 그 뒤로는 129, 130, ... 순서로 실행된다. `생성 index 255 -> 실행 순서 129`는 128로 시작해 128개가 순서대로 실행됐을 때의 마지막인 255가 그 위치라는 뜻이다.
+`demonstrateCurrentP`는 현재 GOMAXPROCS를 그대로 사용해 한 번 실행한다. `demonstrateScaling`은 P를 1, 2, 4, NumCPU로 잠시 바꿔가며 같은 작업을 반복한다. 출력에서 GOMAXPROCS=1일 때 elapsed가 가장 크고 P를 늘릴수록 짧아지는 것을 보면, G가 많아도 P가 병렬 실행의 문턱이라는 것이 직접 관찰된다. P보다 worker 수가 많으면 일부 G는 로컬 런큐에서 대기하게 된다.
 
-`생성 index 0 -> 실행 순서 172`는 전역 run queue에 갔던 batch의 head가 G0이기 때문이다. 지역 run queue가 모두 소진된 후 P가 `globrunqget`으로 전역 큐에서 꺼내면서 G0부터 실행된다. `생성 index 256 -> 실행 순서 300`은 전역 batch의 마지막이 G256이라는 사실을 보여준다. 전체 실행 순서가 생성 순서와 완전히 다르다는 점이 scheduler의 내부 동작을 관찰 가능하게 만든다.
+`cooperativeYieldWorkers`는 runtime.Gosched를 1000번씩 호출하면서 atomic 카운터를 올린다. 결과는 workers * 1000이 나와야 한다. 이 숫자가 정확하다는 것은 Gosched가 현재 G를 실행 큐에서 빼내고 다시 스케줄링해도 어떤 횟수도 잃지 않는다는 뜻이다. 실행 순서는 바뀔 수 있지만 총 횟수라는 불변식은 유지된다.
 
-마지막으로 P를 2개로 올리고 CPU-bound goroutine 2개를 동시에 실행한다. `osThreadCount`가 버스트 직전보다 직후에 증가하는 것을 볼 수 있다. 기존 M 하나로는 P 두 개의 병렬 실행 요구를 만족할 수 없으므로 런타임이 새 M을 만들어 두 번째 P를 acquirep한다. 이 출력은 G 자체가 스레드가 아니라 P가 병렬 실행의 단위이며, M은 필요할 때만 늘어나는 실제 OS 자원이라는 점을 직접 보여준다.
+main_test.go의 `TestCPUBoundDeterministic`은 cpuBound의 반환값이 수식과 일치하는지 확인한다. `TestRunParallelCompletesAllWorkers`는 16개 goroutine 전부가 끝났는지, 각 결과가 순차 계산과 같은지 확인한다. 시간 단정은 전혀 없다. `TestCooperativeYieldWorkersCount`는 workers*1000이라는 총 횟수를 검증한다. `BenchmarkRunParallel`은 현재 GOMAXPROCS에서 처리량을 측정해 P를 조정할 때 참고할 기준을 제공한다.
 
 ## 모르면 겪는 일
 
-goroutine 생성 순서가 실제 실행 순서를 보장한다고 착각하면 재현하기 어려운 버그를 만든다. 특히 한 P에서 연속으로 goroutine을 만들면 마지막에 만든 G가 `runnext`로 들어가 LIFO로 실행된다. 예를 들어 요청을 채널로 보내고 그 순서대로 처리될 것이라고 기대했는데, GOMAXPROCS=1에서도 뒤에 도착한 요청이 먼저 실행되어 응답 순서가 뒤집힐 수 있다. 로그에는 요청 도착 순서와 응답 순서가 어긋나 보이지만 scheduler 문제인지 몰라 오래 헤매는 경우가 많다.
+CPU-bound 워크로드에서 GOMAXPROCS를 의식하지 않으면 goroutine을 아무리 많이 만들어도 처리량이 늘지 않는다. 예를 들어 컨테이너 CPU limit이 4인데 GOMAXPROCS가 1로 고정되어 있으면, 서버는 한 코어만 100% 쓰고 나머지 코어는 놀게 된다. goroutine 수는 수백 개인데 CPU 프로파일에는 `runtime.futex`나 syscall이 별로 없고 전부 runnable 상태로 보이면 P 부족을 의심해야 한다.
 
-CPU-bound 작업이 섞인 서비스에서 GOMAXPROCS를 잘못 설정하면 p99 latency가 GC 주기마다 튀는데 CPU profile에는 user time만 보이고 scheduler time은 보이지 않는다. GOMAXPROCS=1로 두면 모든 G가 코어 하나에서 순서를 기다리므로 나머지 코어가 놀고, 반대로 코어 수보다 훨씬 크게 잡으면 P가 많아져 지역 run queue가 자주 비고, P끼리 steal을 많이 하면서 cache miss와 scheduler overhead가 늘어난다. 이 오버헤드는 profile에서 잘 안 보이기 때문에 원인을 파악하기 어렵다.
+P가 여러 개인데도 OS 스레드가 수천 개까지 늘어나는 경우가 있다. blocking syscall을 수행하는 goroutine이 많으면 M이 커널에서 멈추는 동안 P를 다른 M에게 넘기기 위해 새 OS 스레드가 계속 생길 수 있다. 이걸 모르면 "GOMAXPROCS=4인데 왜 스레드가 2000개지?" 하는 혼란이 온다. OS 스레드 개수는 P 개수와 별개로 늘어날 수 있다는 사실을 알아야 진단이 가능하다.
 
-한 P에서 256개 이상의 G를 burst로 만들면 절반이 global run queue로 이동한다. global run queue는 lock으로 보호되므로 여러 코어에서 이벤트가 동시에 몰리는 fan-out/fan-in 패턴에서 bottleneck이 된다. 특히 네트워크 수신 goroutine 하나가 수천 개의 작업을 만들어 내는 구조에서는 지역 run queue overflow가 전역 큐 경합을 유발하고, 각 작업이 다른 P로 흩어지면서 캐시 지역성이 깨진다. goroutine을 아주 잘게 쪼개서 동시성을 높이면 오히려 느려지는 이유가 여기에 있다.
-
-`LockOSThread`를 남발하면 G와 M이 강하게 묶이면서 P의 장점이 퇴색된다. lock을 건 G는 특정 M에서만 실행되어야 하므로, 그 M이 syscall이나 park 상태에 들어가도 재사용되지 못하고 다른 P가 실행되지 못하는 상황이 생길 수 있다. 너무 많은 G에 `LockOSThread`를 걸면 M 수가 비정상적으로 늘어나고 OS 스레드 context switch 비용이 커진다. `UnlockOSThread`를 빼먹으면 M이 재사용되지 못해 자원 누수처럼 보이기도 한다.
+GODEBUG=schedtrace를 보면 `gomaxprocs`, `idleprocs`, `threads`, `runqueue`가 함께 찍힌다. 이 중 runqueue가 긴 경우 병목이 로컬 런큐인지 글로벌 런큐인지 구분하지 않으면 잘못된 결론을 내린다. 예를 들어 어떤 goroutine이 오래 CPU를 점유하면 한 P의 로컬 큐만 길어지고 다른 P는 놀 수 있다. 이때 GOMAXPROCS를 올려도 해결되지 않는 경우가 많다. 스케줄러 내부 구조를 모르면 이런 증상을 전부 "Go는 느리다"로 치부하게 된다.
 
 ## 언제 신경 쓰고 언제 무시하나
 
-일반적인 서비스에서는 이 지식을 몰라도 잘 돌아간다. CPU-bound 작업이 지배적이지 않고 동시 실행 goroutine 수가 수백 개 미만이라면 지역 run queue가 256개를 넘어 전역으로 넘어갈 일도 적고, work stealing이 성능에 직접 보일 만큼 일어나지도 않는다. GOMAXPROCS를 기본값인 `runtime.NumCPU()`로 두고 goroutine을 너무 잘게 쪼개지 않는 선에서 큰 문제 없이 동작한다.
+대부분의 I/O bound 서비스에서는 기본 GOMAXPROCS를 건드릴 필요가 없다. 데이터베이스 조회나 HTTP 호출을 기다리는 동안 P는 다른 G로 넘어가고, syscall에서 돌아온 G는 runnext나 로컬 런큐에 다시 적재된다. 런타임이 이미 잘 해주는 일이다. 이 단계에서는 P 개수를 최적화해도 응답 시간의 대부분이 네트워크와 디스크에 묻혀 있으므로 체감 효과가 거의 없다.
 
-신경 써야 하는 조건은 명확하다. CPU-bound goroutine이 코어 수보다 훨씬 많거나, 특정 이벤트 루프 하나가 한 번에 수백 개 이상의 G를 만들어 내는 경우에는 GMP의 queue 구조가 성능에 영향을 준다. 이때는 worker pool로 동시 실행 수를 GOMAXPROCS 부근으로 제한하거나, batch 크기를 조절해 지역 run queue가 계속 overflow되지 않도록 만드는 편이 낫다. GOMAXPROCS는 CPU-bound 작업에서는 코어 수와 비슷하게, blocking I/O가 많은 작업에서는 조금 더 크게 주는 것이 일반적이다.
+GMP 구조가 진짜로 중요해지는 때는 CPU-bound goroutine이 동시에 수백 개 이상 도는 경우다. 이미지 처리, 암호 연산, 시뮬레이션 같은 작업이 그렇다. 또는 cgo 호출이나 파일 I/O가 많아 스레드 수가 비정상적으로 늘어날 때도 P와 M의 분리를 알아야 원인을 찾을 수 있다. 이럴 때는 `GODEBUG=schedtrace`와 CPU profile을 함께 보며 P 개수, 로컬 런큐 길이, thread 수를 추적한다.
 
-이 주제를 과하게 신경 쓰면 금방 과최적화에 빠진다. 아직 프로파일에 scheduler time이나 blocking time이 잡히지 않는데 G 수를 수동으로 배치하거나 `GOMAXPROCS`를 미세 조정하는 것은 거의 의미가 없다. 병목이 DB 쿼리나 I/O wait라면 scheduler를 만져도 성능은 그대로다. `GODEBUG=schedtrace=1000`, `GODEBUG=scheddetail=1`, `go tool trace`로 scheduler 동작을 관찰할 수 있지만, 측정 없이 이 값들만 보면서 판단하지 말아야 한다.
+로컬 런큐 크기 256이나 runnext의 존재는 성급하게 코드에서 의존할 필요가 없는 구현 세부 사항이다. 일반 애플리케이션 코드는 goroutine을 만들고 채널로 통신하는 수준을 넘어 스케줄러를 직접 조작할 이유가 없다. 성능이 문제가 될 때 측정을 먼저 하고, 그 측정치가 P 부족이나 스레드 증가를 가리킬 때만 GOMAXPROCS나 실행 환경을 손대는 것이 맞다.
+
+컨테이너 환경에서는 한 가지 예외가 있다. Go 1.24 이전에는 GOMAXPROCS가 컨테이너 CPU limit을 인식하지 못하고 호스트 머신의 코어 수를 그대로 쓰는 문제가 있었다. 최신 Go는 CPU quota를 인식하지만, 명시적으로 GOMAXPROCS를 설정하는 배포가 여전히 많다. 이런 환경에서는 GOMAXPROCS를 limit에 맞추는 것이 GMP 모델을 이해하고 적용하는 가장 실용적인 사례다.
 
 ## 더 파보기
 
-- https://go.dev/src/runtime/proc.go — runqput, runqget, runqputslow, findrunnable, work stealing이 구현된 핵심 파일
-- https://go.dev/src/runtime/runtime2.go — g, m, p, schedt 자료구조 정의
-- https://go.dev/src/runtime/trace.go — scheduler trace 포인트와 실행 흐름
-- https://go.dev/doc/go1.1#runtime — Go 1.1 release note에서 P 도입과 scheduler 개편 언급
-- https://morsmachine.dk/go-scheduler — Go scheduler 내부를 초보자 관점에서 설명한 글
+- runtime/proc.go 스케줄러 코어: https://go.dev/src/runtime/proc.go
+- runtime/runtime2.go G/M/P struct 정의: https://go.dev/src/runtime/runtime2.go
+- Go 스케줄러 설계 문서: https://go.dev/s/go11sched
+- 런타임 환경변수 공식 문서: https://pkg.go.dev/runtime#hdr-Environment_Variables
+- Go issue 트래커의 비동기 preemption 논의: https://github.com/golang/go/issues/24543
