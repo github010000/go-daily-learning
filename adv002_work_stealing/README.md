@@ -1,72 +1,79 @@
 ## 한 줄 요약
 
-Go 스케줄러는 OS 스레드마다 글로벌 큐 하나를 쓰는 대신, P(processor)마다 로컬 런큐를 두고, 한 P 가 자기 큐를 비우면 다른 P 의 큐에서 절반을 훔치는 work stealing 으로 부하를 분산한다. runnext 슬롯은 새로 만든 goroutine 이 곧바로 같은 P 에서 실행되도록 보호해서, 다른 P 에 빼앗기지 않게 하고 캐시 지역성과 지연 시간을 개선한다. 훔치기에 실패하면 전역 런큐, 네트워크 폴러, 스핀, sleep 순으로 내려가며 일을 찾는다.
+Go 런타임은 각 P마다 지역 runq와 별도의 runnext 슬롯을 두어, 방금 실행 가능해진 goroutine을 같은 P에서 즉시 실행시켜 cache locality와 wakeup 지연을 줄인다. P가 할 일이 없으면 다른 P의 runq에서 절반을 훔쳐 오는데, 이때 head 쪽에서 훔쳐 최근 작업은 원래 P에 남긴다.
+
+이 글은 runtime/proc.go의 work stealing과 runnext가 왜 이렇게 설계됐는지, 실제 런타임이 어떤 순서로 훔치는지, 그리고 이 구조가 없으면 어떤 지연이 생기는지를 관찰 가능한 Go 코드와 함께 설명한다.
 
 ## 왜 이런 설계인가
 
-OS 스레드 하나당 하나의 글로벌 큐를 두고 모든 goroutine 이 거기서 일을 꺼내는 구조는 간단하지만, 스레드 수가 늘어나면 큐 잠금 경합이 폭발한다. 수백 개 스레드가 매번 같은 뮤텍스를 잡고 작업을 넣고 빼면, 실제 CPU 작업 시간보다 잠금 대기와 캐시 라인 경합이 더 커진다. 또한 한 스레드가 자주 사용하던 데이터가 다른 스레드로 넘어가면 CPU 캐시가 무효화되어 캐시 미스가 급증한다. Go 는 goroutine 을 수십만 개까지 실행해야 하므로 이 비용은 감당할 수 없다.
+Go는 OS 스레드 하나에 goroutine 여러 개를 얹는 M:N 스케줄러를 쓴다. OS 스레드는 생성·문맥 전환 비용이 크고 커널 자원을 차지하므로, goroutine마다 OS 스레드를 하나씩 만들 수는 없었다. 그래서 여러 goroutine을 소수의 OS 스레드에 multiplexing해야 했고, 이때 핵심은 "어느 goroutine을 어느 스레드에서 언제 실행할 것인가"를 빠르게 정하는 것이다.
 
-그래서 Go 런타임은 GOMAXPROCS 개수만큼의 P 를 만들고, P 마다 runq(로컬 런큐)를 준다. 자기 P 의 큐에서 task 를 꺼내면 잠금이 필요 없고, 다른 P 와 충돌하지 않는다. 한 P 가 일이 없을 때만 다른 P 의 큐를 훔치므로, 잠금 경합이 드물게 발생한다. 이것이 work stealing 의 핵심 동기다. 훔칠 때도 큐 전체가 아니라 절반만 가져가서, 훔친 P 와 원래 P 사이에 부하가 더 고르게 퍼진다.
+초기 Go 스케줄러에는 전역 run queue 하나가 있었다. 모든 P가 그곳에서 작업을 꺼내다 보니 CPU 코어가 늘어날수록 전역 큐에 lock 경합이 심해졌다. 이를 해결하기 위해 P마다 지역 runq를 두었고, 지역 runq는 대부분 lock 없이 동작하게 만들었다. 하지만 지역 runq만 두면 어떤 P는 일이 많고 다른 P는 놀 수 있다. 이 불균형을 해결하는 메커니즘이 work stealing이다. P가 자기 runq를 비우면 다른 P의 runq에서 작업을 훔쳐 온다.
 
-runnext 슬롯은 work stealing 의 단점을 보완한다. go 문으로 새 goroutine 을 만들면, 그것을 만든 P 가 그 goroutine 을 가장 먼저 실행할 가능성이 높다. 만약 runnext 없이 그냥 runq 에 넣으면, 다른 P 가 즉시 훔쳐가서 생성자 P 가 아닌 엉뚱한 P 에서 실행될 수 있다. 그러면 방금 생성자 P 가 사용하던 데이터가 다른 P 의 캐시로 옮겨가야 해서 캐시 미스가 발생하고, 생성자 P 는 그 goroutine 의 완료를 기다리면서 손해를 본다. runnext 는 "방금 만든 goroutine 은 내가 바로 실행한다"는 의도를 표현해, 훔치기 대상에서 제외한다.
+그런데 지역 runq를 단순 FIFO로만 두면 "방금 실행 가능해진 goroutine"이 불리해진다. 예를 들어 goroutine A가 channel에 값을 보내서 goroutine B를 깨웠다면, B는 A와 같은 P에서 실행되는 것이 cache hit에 유리하다. 하지만 FIFO runq라면 B는 tail에 붙어 앞에 쌓인 오래된 작업들이 모두 처리된 뒤에야 실행된다. 이 문제를 풀기 위해 runnext라는 단일 슬롯을 runq와 분리한 것이다.
 
-대안으로는 "글로벌 큐만 쓰기", "큐마다 잠금을 아주 작게 나누기", "작업을 직접 지정한 스레드에 보내기" 등이 있었다. 글로벌 큐는 경합, 잠금 세분화는 관리 복잡도, 직접 지정은 부하 불균형을 만든다. work stealing 은 구현이 비교적 단순하면서도 잠금을 드물게 만들고, 훔치는 과정에서 자연스럽게 부하 균형이 맞는 장점이 있어 채택됐다.
+runnext는 전체를 LIFO로 바꾸지 않고 딱 한 개만 최근 작업에 우선권을 준다. 전체 LIFO면 오래된 작업이 계속 밀려 starvation이 생길 수 있고, FIFO면 wakeup locality가 나빠진다. runnext는 이 둘 사이의 절충이다. 방금 만들어진 작업은 자기 P에서 즉시 실행되고, 나머지 오래된 작업은 runq에서 FIFO 순서를 유지하며 다른 P가 훔쳐 갈 수 있게 한다.
+
+work stealing의 방향도 중요하다. P가 다른 P의 runq에서 작업을 훔칠 때 tail이 아니라 head에서 훔친다. head에서 훔치면 오래된 작업이 이동하고, 최근에 만들어진 cache-hot한 작업은 원래 P에 남는다. tail에서 훔치면 방금 만든 goroutine을 다른 P로 보내 cache locality를 파괴한다. 이렇게 head steal과 runnext는 서로 맞물려 locality와 fairness를 동시에 확보한다.
 
 ## 어떻게 동작하는가
 
-Go 런타임의 스케줄러 소스는 `runtime/proc.go` 에 있다. P 구조체는 `runq` 라는 크기 256 인 원형 큐와 `runnext` 라는 단일 포인터 슬롯을 가진다. `runqput` 함수는 새 goroutine 을 넣을 때 `runnext` 가 비어 있으면 `runnext` 에 넣고, 이미 차 있으면 기존 `runnext` 를 `runq` 로 밀어내고 새 goroutine 을 `runnext` 에 넣는다. 이렇게 하면 가장 최근에 만든 goroutine 이 항상 P 의 맨 앞에 있게 된다. `runqget` 은 반대로 `runnext` 를 먼저 확인하고, 없으면 `runq` 에서 꺼낸다. `runq` 는 원형 큐라서 배열 인덱스 계산만으로 push/pop 이 이루어지고, 락을 쓰지 않는다.
+Go 런타임의 핵심 자료구조는 runtime/runtime2.go의 `type p struct`에 있다. P는 `runq [256]guintptr`, `runqhead uint32`, `runqtail uint32`, `runnext guintptr` 필드를 가진다. `runq`는 256개짜리 원형 큐이고, `runqhead`와 `runqtail`은 lock-free 소비·생산을 위한 인덱스다. `runnext`는 runq보다 먼저 확인하는 별도 슬롯이다.
 
-work stealing 은 `findrunnable` 이라는 함수에서 일어난다. P 가 실행할 goroutine 이 없으면 먼저 전역 런큐를 확인하고, 그다음 다른 P 의 로컬 큐를 훔친다. 훔치는 함수는 `runqgrab` 인데, 대상 P 의 `runq` 에서 절반을 가져와 자신의 `runq` 에 넣는다. 이때 `runnext` 슬롯은 절대로 훔치지 않는다. `runnext` 는 생성자 P 만 접근할 수 있는 일종의 전용 슬롯이다. 훔친 여러 goroutine 중 첫 번째는 곧바로 실행하고, 나머지는 로컬 큐에 쌓아둔다.
+goroutine이 실행 가능해지면 runtime/proc.go의 `runqput`이 호출된다. `runqput`의 두 번째 인자 `next`가 true이면 runnext 슬롯에 넣는다. 이미 runnext에 값이 있으면 기존 값을 runq tail에 밀어 넣고 새 goroutine을 runnext에 둔다. runq가 가득 차면 `runqputslow`가 전역 runq로 보낸다. `next`는 channel send, mutex unlock, 새 goroutine 생성처럼 현재 goroutine이 방금 다른 goroutine을 깨운 경우 주로 true다.
 
-훔치기가 실패하면 어디로 가는가? `findrunnable` 은 다음 순서로 일을 찾는다. 첫째, 자신의 `runnext` 와 `runq`. 둘째, 전역 런큐. 셋째, 네트워크 폴러(netpoll) 깨우기. 넷째, 다른 P 의 `runq` 훔치기. 다섯째, 일정 시간 스핀(spin). 여섯째, OS 스레드를 잠든 상태로 전환(stopm)한다. 이렇게 단계적으로 시도하기 때문에, 잠깐 일이 없어도 바로 잠들지 않고 바쁜 대기로 지연을 줄인다. 실제로 `findrunnable` 안에는 `spinning`, `nmspinning`, `sched.nmspinning` 같은 변수들이 등장한다.
+P가 다음 goroutine을 고를 때 `runqget`을 호출한다. `runqget`은 먼저 `runnext`를 확인해 값이 있으면 CAS로 nil로 바꾸고 반환한다. runnext가 없으면 `runqhead`와 `runqtail`을 읽어 runq에서 하나 꺼낸다. 즉 실행 순서는 runnext가 runq보다 항상 우선한다. 이 때문에 방금 깨어난 goroutine은 runq의 오래된 작업들을 제치고 즉시 실행될 수 있다.
 
-본 저장소의 `main.go` 는 이 구조를 교육용으로 축소해 놓았다. `processor` 는 `runq` 슬라이스와 `runnext` 포인터를 가지고, `stealFrom` 은 다른 P 의 `runq` 절반을 가져오되 `runnext` 는 건드리지 않는다. `findRunnable` 은 `runqget` → 전역 큐 → `stealFrom` 순으로 일을 찾는다. 실제 런타임은 락프리 원형 큐와 정교한 스핀 카운트를 쓰지만, 핵심적인 제어 흐름은 동일하다.
+P가 자기 runq와 runnext를 모두 비우면 `findRunnable`은 먼저 전역 runq, netpoll, timer 등을 확인한 뒤 `stealWork`를 호출한다. `stealWork`는 최대 4번 시도하고, 각 시도마다 `stealOrder`라는 랜덤 시작 순서로 모든 P를 순회한다. 희생 P에 작업이 있으면 `runqsteal`이 불린다. `runqsteal`은 `runqgrab`으로 희생 P의 runq에서 `n = t - h; n = n - n/2` 공식대로 올림 절반을 가져온다. 훔친 batch 중 하나는 즉시 실행하고 나머지는 도둑 P의 runq tail에 붙인다.
+
+`runqgrab`은 `stealRunNextG`가 true인 마지막 시도에서만 runq가 비어 있을 경우 runnext를 훔칠 수 있다. runnext에 담긴 가장 최근의 goroutine을 다른 P로 보내면 locality가 깨지므로, 정말 다른 일이 없을 때만 최후의 수단으로 훔치는 것이다. 이 모든 과정은 runtime/proc.go의 `findRunnable`, `stealWork`, `runqsteal`, `runqgrab`에 실제 코드로 존재한다.
 
 ## 돌려보기
 
-이 디렉토리에서 그대로 실행할 수 있는 명령을 순서대로 실행해 보자.
-
 ```bash
-go vet ./...                 # 정적 검사: 시뮬레이션 코드의 동시성 문제와 잘못된 API 사용을 걸러낸다
-go build -o /dev/null ./...  # 컴파일 확인: 타입 오류와 누락된 임포트를 잡는다
-go run .                     # 시연 실행: work stealing 과 runnext affinity 지표를 출력한다
-go test -v ./...             # 테스트: runnext 우선 실행, 훔치기 제외, 분배 불변식을 검증한다
-go test -race ./...          # 동시성 주제이므로 반드시: 뮤텍스 누락이나 data race 를 검사한다
-GODEBUG=schedtrace=1000 go run .  # 실제 런타임 스케줄러 추적: P 별 runqueue 길이와 idle 상태가 주기적으로 표준 에러에 출력된다
+go vet ./...                 # 시뮬레이션 코드와 테스트의 정적 검사
+go build -o /dev/null ./...  # 컴파일 확인
+go run .                     # 시연 실행: FIFO vs runnext의 hot task tick 차이를 본다
+go test -v ./...             # 테스트: runnext 불변식, 도둑질 배치, 지연 단축 검증
+go test -race ./...          # 동시성 이슈가 없음을 -race로 확인
+GODEBUG=schedtrace=1000 go run .  # 실제 런타임 스케줄러 trace와 함께 실행
 ```
 
-`go run .` 출력에서 `P별 처리 수`를 보면, P0 에만 task 를 몰아넣었는데도 다른 P 들이 일정량을 처리한 것을 확인할 수 있다. 이 숫자들이 work stealing 이 실제로 일어났다는 증거다. `GODEBUG=schedtrace=1000 go run .` 명령은 이 프로그램을 실행하면서 동시에 실제 Go 런타임의 스케줄러 상태를 주기적으로 보여준다. 출력에서 `P0: ...` 줄마다 `runnable` goroutine 수가 표시되는데, 시간이 지나면서 여러 P 사이에 숫자가 비슷해지는 것을 관찰할 수 있다.
+`go run .`에서는 FIFO 모드에서 hot task가 tick=5에 실행되고 runnext 모드에서는 tick=1에 실행되는 로그가 나온다. `GODEBUG=schedtrace=1000` 명령은 우리 모델 출력 뒤에 Go 런타임의 `SCHED` trace를 주기적으로 출력한다. 이 데모는 시뮬레이션이라 P가 대부분 idle이지만, `P` 상태와 `IDLE` 표시가 어떻게 나오는지 보면 스케줄러가 어떤 P를 쉬게 하는지 감을 잡을 수 있다.
 
 ## 코드로 확인하기
 
-`main.go` 는 두 가지를 시연한다. 첫째, `runWorkStealingDemo` 는 task 20000개를 P0 의 로컬 큐에만 넣고 P 4개로 실행한다. 출력에서 `runnext 사용 O` 일 때 P0 이 처리한 수를 보면, 전체의 절반 이상이 P0 에서 실행된 것을 확인할 수 있다. `runnext 사용 X` 일 때는 P0 의 처리 비율이 뚝 떨어진다. 왜냐하면 runnext 가 없으면 P0 의 runq 에 쌓인 task 들이 다른 P 에 의해 절반씩 훔쳐가기 때문이다. runnext 슬롯은 새로 만든 task 가 P0 에 남아 즉시 실행되도록 지켜준다.
+main.go의 `runHotLatency`는 P0 runq에 task 1부터 10까지 넣고 시작한다. tick 0에서 P0이 task 1을 실행하면서 hot task 999를 `enqueue`한다. P1은 idle이라 P0의 runq에서 올림 절반을 훔쳐 첫 task를 즉시 실행한다. 이때 FIFO 모드라면 hot task가 P0의 runq tail에 남아 앞에 남은 7,8,9,10 뒤에 서기 때문에 tick=5에 실행된다. runnext 모드라면 hot task가 P0의 runnext에 들어가므로 다음 tick에서 P0이 runq보다 먼저 runnext를 꺼내 tick=1에 실행된다.
 
-둘째, `runNextAffinityDemo` 는 같은 P 에서 실행되는 비율을 직접 수치로 보여준다. runnext 사용 O 일 때 `samePWith` 가 runnext 사용 X 일 때보다 훨씬 크다. 이는 캐시 지역성에 중요한 의미를 가진다. P0 에서 만든 task 가 P0 에서 실행되면 그 task 가 접근하는 데이터가 이미 P0 을 도는 OS 스레드의 CPU 캐시에 있을 가능성이 높다. 다른 P 로 넘어가면 그 캐시 라인을 무효화하고 다시 가져와야 하므로, 실제 CPU 바운드 작업에서 수십 퍼센트의 성능 차이가 날 수 있다.
+출력에서 `[FIFO mode]`와 `[runnext mode]`의 `hot task(#999) executed at tick=...` 부분을 비교하면 runnext가 준 지연 단축을 수치로 확인할 수 있다. `steal+run first, stole 5` 같은 이벤트는 runqgrab의 올림 절반 공식(여기서는 9개 중 5개, 10개 중 5개)을 반영한다.
 
-셋째, `measureRunNextLatency` 는 runqput/runqget 왕복 시간을 비교한다. runnext 는 단일 포인터 슬롯이라 잠금 없이 O(1)로 접근되지만, runq 슬라이스는 append 와 슬라이싱이 일어나서 아주 약간 느리다. 이 차이는 마이크로초 단위라 작아 보이지만, 실제 런타임에서 수십만 goroutine 이 반복적으로 큐를 조작하면 누적 비용과 캐시 미스가 커진다.
+main_test.go는 세 가지를 검증한다. 첫 번째 테스트는 runnext에 새 작업이 들어오면 기존 runnext가 runq tail로 밀려나는지, `popLocal`이 runnext를 먼저 반환하는지를 확인한다. 두 번째 테스트는 동일한 시나리오에서 runnext 모드의 hot task tick이 FIFO 모드보다 작은지 검증한다. 세 번째 테스트는 `stealHalf`가 runq head에서 올림 절반을 정확히 가져가는지 확인한다.
 
-`main_test.go` 는 세 가지를 검증한다. `TestRunqputRunNext` 는 runnext 가 비어 있을 때 `runqput` 이 runnext 에 넣고, `runqget` 이 그 task 를 우선 반환하는지 확인한다. `TestStealFromDoesNotTouchRunnext` 는 다른 P 가 훔칠 때 `runnext` 슬롯의 task 는 절대 가져가지 않고, `runq` 에서만 절반을 훔치는지 확인한다. `TestWorkStealingDistribution` 은 불균등하게 넣은 task 가 모든 P 에 분산되어 처리되고, 전체 처리 수가 정확히 일치하는지 확인한다. 이 테스트들은 `-race` 플래그로도 통과하며, 시간에 의존하는 단정을 사용하지 않는다.
+이 시뮬레이션은 실제 Go 런타임을 완전히 재현한 것은 아니다. 실제 런타임에는 전역 runq, netpoll, timer, sysmon, random victim 선택, 4번의 steal 시도, CAS 기반 lock-free 연산이 더 있다. 하지만 runq와 runnext가 지연에 미치는 영향은 이 결정적 모델로도 충분히 관찰 가능하다.
 
 ## 모르면 겪는 일
 
-work stealing 과 runnext 를 모르면 실제 서비스에서 미묘한 성능 문제를 겪는다. 가장 흔한 증상은 CPU 코어가 여러 개인데도 한 코어만 100% 가까이 사용되고 나머지는 놀고 있는 경우다. CPU 프로파일을 떠 보면 특정 함수가 오래 걸리는 것처럼 나오지만, 실제 원인은 스케줄러가 아니라 작업 분배 구조에 있다. 예를 들어 글로벌 큐에 뮤텍스를 걸고 모든 goroutine 이 거기서 일을 가져가면, 처음에는 잘 돌아가다가 동시성 수치가 올라가면 p99 지연이 주기적으로 튄다. 이때 CPU 프로파일에는 뮤텍스 대기 시간이 잡히지 않아 원인을 찾기 어렵다.
+runnext를 모르면 channel close나 mutex unlock 직후의 goroutine wakeup 지연을 오해할 수 있다. 예를 들어 어떤 P에 오래된 작업이 10개 쌓여 있고, 현재 실행 중인 goroutine이 channel을 닫아서 대기 중이던 goroutine을 깨운다. runnext가 있으면 깨어난 goroutine이 즉시 실행되지만, FIFO만 생각하고 디버깅하면 "왜 깨어난 goroutine이 queue 앞으로 점프하지 못하고 한참 뒤에 실행되지?"라는 혼란이 생긴다.
 
-runnext 를 모르면 "왜 내가 만든 goroutine 이 엉뚱한 스레드에서 실행되지?"라는 의문을 갖게 된다. 특히 채널로 완료 신호를 주고받는 패턴에서, `go func(){ ch <- 1 }()` 직후 `<-ch` 로 기다리는 코드가 다른 P 로 넘어가면 왕복 지연이 커진다. CPU 캐시를 공유해야 하는 연산에서 goroutine 이 다른 P 로 훔쳐지면 캐시 미스가 발생해 처리율이 떨어진다. 벤치마크를 잘못 짜서 GOMAXPROCS=1 로 돌리면 work stealing 이 일어나지 않는데도 "병렬 처리가 효과 없다"고 오해할 수도 있다.
+자신이 직접 work stealing 비슷한 구조를 짜면 tail에서 훔치기 쉽다. tail에서 훔치면 cache locality가 무너지고 p99 latency가 GC 주기나 cache miss와 섞여 튀는데 CPU 프로파일에는 명확한 hot spot이 안 잡힌다. 이런 증상은 "코드는 단순한데 왜 캐시 미스가 많지?"로 이어진다. Go 런타임이 head에서 훔치는 이유를 모르면 같은 실수를 반복한다.
 
-이 지식을 모르면 잘못된 최적화를 하기 쉽다. 예를 들어 goroutine 수를 줄이기 위해 작업을 글로벌 큐에 직접 넣는 코드를 작성하면, 오히려 뮤텍스 경합이 생겨서 더 느려진다. 반대로 runnext 의 존재를 모르고 "왜 이 goroutine 이 예상보다 빨리 실행되지?"라고 생각해 `runtime.Gosched` 를 과도하게 호출하면, runnext 의 이점을 스스로 없애고 오히려 스케줄링 오버헤드만 키운다. Go 런타임이 이미 잘 해주는 일을 사용자가 다시 구현하려다 성능을 깎아먹는 셈이다.
+또한 runq와 runnext가 분리돼 있다는 것을 모르면 `GODEBUG=schedtrace=1000`이나 `go tool trace`에서 goroutine이 예상과 다른 P에서 실행되는 모습을 보고 race나 버그로 오판할 수 있다. 실제로는 스케줄러가 work stealing으로 합법적으로 P를 옮긴 것이며, 이때 runnext가 있으면 옮겨지기 전에 같은 P에서 최대한 실행된다는 것을 이해해야 정확한 프로파일 해석이 가능하다.
 
 ## 언제 신경 쓰고 언제 무시하나
 
-goroutine 수가 수천 개 이하이거나, 작업이 대부분 IO 바운드(네트워크, 디스크, 채널 대기)라면 work stealing 과 runnext 는 거의 신경 쓸 필요가 없다. IO 대기 중인 goroutine 은 P 를 떠나 있고, 실행 가능한 goroutine 수가 적어서 훔치기 자체가 드물게 일어난다. 이 경우에는 코드 가독성과 유지보수성이 더 중요하다. GOMAXPROCS 를 늘려도 성능이 나아지지 않는 대표적인 경우가 바로 IO 바운드 워크로드다.
+대부분의 Go 애플리케이션 코드는 이 내부를 몰라도 잘 동작한다. goroutine 수가 수백 개 수준이고 CPU 사용률이 낮으면 runnext와 work stealing은 눈에 띄는 차이를 만들지 않는다. 이 수준까지 신경 쓰는 것은 과최적화다. 코드를 단순하게 유지하고 표준 channel, sync 패키지를 쓰는 편이 낫다.
 
-CPU 바운드 작업이 많고 goroutine 수가 수만 개를 넘어가면 이 지식이 중요해진다. 특히 p99 지연이 GC 주기마다 튀거나, 특정 코어만 과부하되는 증상이 보이면 스케줄러 동작을 의심해야 한다. `GODEBUG=schedtrace=1000` 으로 P 별 runqueue 길이를 관찰하면, 어느 P 에 일이 몰리는지, 훔치기가 얼마나 자주 일어나는지 알 수 있다. runnext 의 효과를 보려면 CPU 프로파일과 하드웨어 성능 카운터로 캐시 미스를 함께 봐야 한다.
+이 지식이 중요해지는 때는 P 수보다 훨씬 많은 goroutine이 지속적으로 wakeup/sleep을 반복하는 고성능 서비스다. 예를 들어 HTTP 서버에서 channel로 요청을 넘기거나, 많은 goroutine이 하나의 mutex를 기다리는 구조라면 runnext가 p99 wakeup latency에 영향을 준다. `go tool trace`에서 goroutine이 P 사이를 자주 이동하거나, 한 P만 바쁘고 다른 P가 놀고 있다면 work stealing과 runnext 동작을 의심해 봐야 한다.
 
-초당 수십만 개의 짧은 goroutine 을 생성하는 서버라면 runnext 의 우선 실행이 응답 지연에 직접 영향을 준다. 이런 극단적인 경우가 아니라면, "go 문으로 만들고 채널로 통신하는" 표준 패턴을 그대로 쓰는 것이 최선이다. 런타임이 이미 최적화해 놓은 work stealing 과 runnext 위에서 동작하도록 두는 것이 과최적화를 피하는 길이다.
+자신의 코드가 특정 P에 작업을 몰아 넣고 있다면 sharding이나 batch 전략을 바꾸는 것이 scheduler 튜닝보다 효과적이다. runnext는 자동으로 동작하므로 직접 조작할 수 없고, GOMAXPROCS나 channel buffer 크기, shard 개수 같은 상위 설계를 조정하는 것이 실제 개선으로 이어진다.
 
 ## 더 파보기
 
-- [runtime/proc.go 소스](https://go.dev/src/runtime/proc.go) — `runqput`, `runqget`, `runqgrab`, `findrunnable`, `stealWork` 가 실제 구현이다. 특히 `findrunnable` 의 주석을 읽으면 스핀과 sleep 조건이 자세히 설명돼 있다.
-- [Go 스케줄러 공식 문서](https://go.dev/s/go15gcpacing) — Go 1.5 에서 GOMAXPROCS 가 CPU 수로 기본 설정된 이유와 work stealing 설계 배경을 설명한다.
-- [The Go scheduler (Ardan Labs 블로그)](https://www.ardanlabs.com/blog/2015/02/scheduler-tracing-in-go.html) — GODEBUG=schedtrace 출력을 해석하는 방법과 P, M, G 관계를 그림으로 보여준다. 런타임 내부에 처음 입문할 때 좋다.
-- [Go issue 10077: work stealing starves runnext](https://github.com/golang/go/issues/10077) — runnext 가 훔치기에서 제외되면서 생긴 부하 불균형 문제와 해결 과정을 볼 수 있는 실제 이슈다.
-- [runtime/proc.go 의 findrunnable 주석](https://go.dev/src/runtime/proc.go#L2556) — 훔치기 실패 시 전역 큐, netpoll, spin, stopm 순서를 코드와 함께 확인할 수 있다.
+- runtime/proc.go: runqput, runqget, runqgrab, runqsteal, stealWork, findRunnable 구현
+  https://go.dev/src/runtime/proc.go
+- runtime/runtime2.go: p 구조체의 runq, runqhead, runqtail, runnext 필드 정의
+  https://go.dev/src/runtime/runtime2.go
+- Go 스케줄러 디자인 문서 (Go 1.1 이전 전역 큐에서 현재 work stealing까지)
+  https://go.dev/s/go11sched
+- Go 런타임 트레이스와 스케줄러 상태를 보는 공식 문서
+  https://go.dev/doc/diagnostics
