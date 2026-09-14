@@ -2,287 +2,242 @@ package main
 
 import (
 	"fmt"
-	"math/rand"
-	"sync"
-	"sync/atomic"
-	"time"
+	"runtime"
 )
 
-// task 는 스케줄러가 실행할 작업 한 개를 흉내낸다.
-// payload 는 CPU 캐시에 올라가는 데이터를 표현해서, 다른 P 로 넘어갈 때
-// 캐시 미스가 나는 상황을 시뮬레이션하기 위해 넣었다.
-type task struct {
-	id         int
-	payload    [64]byte
-	executedOn int // 이 task 를 실행한 processor 의 id
-}
+// Go 런타임의 work stealing과 runnext를 관찰하기 위한 작은 모델이다.
+// 실제 runtime/proc.go를 그대로 가져온 것은 아니지만, runq와 runnext가
+// 어떻게 스케줄링 지연을 바꾸는지 결정적으로 보여준다.
+//
+// 이 코드는 P가 2개뿐인 상황에서 한 P에 오래된 작업 10개가 쌓여 있고,
+// 그중 첫 작업이 "hot task"를 새로 만들어 내는 시나리오를 재현한다.
+// hot task는 channel close, mutex unlock처럼 방금 실행 가능해진 goroutine에
+// 해당한다. runnext가 있으면 hot task가 같은 P에서 즉시 실행되고,
+// 없으면 runq tail에 붙어 앞선 작업들이 처리될 때까지 기다린다.
 
-// processor 는 Go 런타임의 P(processor)를 축소해서 흉내낸다.
-// 실제 런타임의 P 는 runq(로컬 런큐)와 runnext 라는 두 개의 실행 대기열을 가진다.
-// 여기서는 교육용으로 뮤텍스를 써서 단순화했다. 실제 런타임은 락프리다.
-type processor struct {
-	id       int
-	mu       sync.Mutex
-	runq     []*task // 로컬 런큐. 실제 runtime 에서는 원형 큐지만 여기서는 슬라이스.
-	runnext  *task   // runnext 슬롯. 새로 만든 goroutine 이 우선 들어간다.
-	processed int    // 이 P 가 실행한 task 수
-	steals   int    // 이 P 가 다른 P 에게서 훔친 task 수
-}
+const (
+	hotTaskID     = 999
+	triggerTaskID = 1
+)
 
-// scheduler 는 여러 processor 와 전역 큐를 묶어 관리한다.
-// 실제 Go 런타임에는 전역 런큐(runq)가 있고, 여기서는 globalQueue 로 표현한다.
-type scheduler struct {
-	procs       []*processor
-	globalMu    sync.Mutex
-	globalQueue []*task
-}
+// QueueMode는 지역 큐에 작업을 넣는 두 가지 방식을 나타낸다.
+// QueueFIFO는 runnext가 없는 단순 FIFO 모델이고,
+// QueueRunnext는 Go 런타임이 실제로 사용하는 runq + runnext 모델이다.
+type QueueMode int
 
-// newScheduler 는 주어진 개수의 processor 를 가진 스케줄러를 만든다.
-func newScheduler(numP int) *scheduler {
-	s := &scheduler{}
-	for i := 0; i < numP; i++ {
-		s.procs = append(s.procs, &processor{id: i})
+const (
+	QueueFIFO QueueMode = iota
+	QueueRunnext
+)
+
+func (m QueueMode) String() string {
+	if m == QueueRunnext {
+		return "runnext"
 	}
-	return s
+	return "FIFO"
 }
 
-// runqput 은 task 를 P 의 로컬 대기열에 넣는다.
-// useRunNext 가 true 이고 runnext 슬롯이 비어 있으면 runnext 에 넣는다.
-// 실제 런타임의 runqput 은 runnext 가 비어 있으면 runnext 에 넣고,
-// 아니면 runq 에 넣는다. 이렇게 해서 새 goroutine 이 같은 P 에서 곧바로 실행된다.
-func (s *scheduler) runqput(p *processor, t *task, useRunNext bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if useRunNext && p.runnext == nil {
-		p.runnext = t
+type Task struct {
+	ID       int
+	Producer int // 이 작업을 만든 P ID
+}
+
+// Proc는 Go 런타임의 p 구조체에서 runq와 runnext만 간추린 것이다.
+// 실제 runtime/runtime2.go의 p는 runq [256]guintptr, runqhead, runqtail,
+// runnext guintptr를 가진다.
+type Proc struct {
+	ID      int
+	Runq    []Task
+	Runnext *Task
+}
+
+func newProc(id int) *Proc {
+	return &Proc{ID: id}
+}
+
+func (p *Proc) hasWork() bool {
+	return p.Runnext != nil || len(p.Runq) > 0
+}
+
+// enqueue는 runtime/proc.go의 runqput에 해당한다.
+// Go 런타임은 next가 true이면 먼저 runnext 슬롯을 채우고,
+// 기존 runnext가 있으면 runq tail로 밀어낸다.
+// FIFO 모드에서는 그냥 runq tail에만 넣는다.
+func (p *Proc) enqueue(mode QueueMode, t Task) {
+	if mode == QueueRunnext {
+		if p.Runnext == nil {
+			p.Runnext = &t
+		} else {
+			// 이미 runnext가 있으면 기존 값을 runq 뒤로 보내고
+			// 새 작업을 runnext에 둔다. 이것이 최근 작업 우선 실행의 핵심이다.
+			p.Runq = append(p.Runq, *p.Runnext)
+			p.Runnext = &t
+		}
 		return
 	}
-	p.runq = append(p.runq, t)
+	p.Runq = append(p.Runq, t)
 }
 
-// runqget 은 P 의 로컬 대기열에서 task 를 하나 꺼낸다.
-// useRunNext 가 true 이면 runnext 슬롯을 먼저 확인한다.
-// 실제 런타임의 runqget 도 runnext 를 먼저 확인하고, 없으면 runq 에서 꺼낸다.
-func (s *scheduler) runqget(p *processor, useRunNext bool) *task {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if useRunNext && p.runnext != nil {
-		t := p.runnext
-		p.runnext = nil
-		return t
+// popLocal은 runtime/proc.go의 runqget에 해당한다.
+// runnext를 먼저 확인하고, 없으면 runq head에서 가져온다.
+func (p *Proc) popLocal() (Task, bool) {
+	if p.Runnext != nil {
+		t := *p.Runnext
+		p.Runnext = nil
+		return t, true
 	}
-	if len(p.runq) == 0 {
+	if len(p.Runq) == 0 {
+		return Task{}, false
+	}
+	t := p.Runq[0]
+	p.Runq = p.Runq[1:]
+	return t, true
+}
+
+// stealHalf는 runtime/proc.go의 runqgrab이 하는 일을 단순화한 것이다.
+// 실제 runqgrab은 희생 P의 runq에서 올림 절반(n - n/2)을 가져온다.
+// 여기서는 slice 복사로 같은 효과를 낸다.
+func (p *Proc) stealHalf(victim *Proc) []Task {
+	n := len(victim.Runq)
+	if n == 0 {
 		return nil
 	}
-	t := p.runq[0]
-	p.runq = p.runq[1:]
-	return t
+	steal := (n + 1) / 2 // ceil(n/2). 실제 runqgrab은 n = t-h; n = n - n/2
+	stolen := make([]Task, steal)
+	copy(stolen, victim.Runq[:steal])
+	victim.Runq = victim.Runq[steal:]
+	return stolen
 }
 
-// getFromGlobal 은 전역 큐에서 task 를 하나 꺼낸다.
-// 실제 런타임의 findrunnable 은 전역 runq 를 주기적으로 확인한다.
-func (s *scheduler) getFromGlobal() *task {
-	s.globalMu.Lock()
-	defer s.globalMu.Unlock()
-	if len(s.globalQueue) == 0 {
-		return nil
+type TraceEvent struct {
+	Tick   int
+	P      int
+	TaskID int
+	Note   string
+}
+
+func (e TraceEvent) String() string {
+	return fmt.Sprintf("tick=%2d P=%d task=%4d %s", e.Tick, e.P, e.TaskID, e.Note)
+}
+
+type LatencyResult struct {
+	Mode    QueueMode
+	HotTick int
+	Stolen  int
+	Events  []TraceEvent
+}
+
+// runHotLatency는 P 2개짜리 결정적 시나리오를 실행해
+// hot task가 몇 번째 tick에 실행되는지 기록한다.
+//
+// 초기 상태: P0 runq에 task 1..10이 들어 있다. P1은 비어 있다.
+// tick 0: P0이 task 1을 실행하면서 hot task(#999)를 같은 P에 enqueue 한다.
+//         P1은 idle이므로 P0의 runq에서 절반을 훔쳐 first task를 즉시 실행한다.
+// 그 뒤부터는 각 P가 local work를 하나씩 실행한다.
+//
+// runnext 모드에서는 hot task가 P0의 runnext에 들어가므로
+// 다음 tick에서 P0이 즉시 실행한다.
+// FIFO 모드에서는 hot task가 P0의 runq tail에 붙으므로
+// 앞에 남은 7,8,9,10이 먼저 실행된 뒤에야 실행된다.
+func runHotLatency(mode QueueMode) LatencyResult {
+	p0 := newProc(0)
+	p1 := newProc(1)
+
+	// P0 runq에 task 1..10을 순서대로 채운다. task 1이 head다.
+	for i := 1; i <= 10; i++ {
+		p0.Runq = append(p0.Runq, Task{ID: i, Producer: 0})
 	}
-	t := s.globalQueue[0]
-	s.globalQueue = s.globalQueue[1:]
-	return t
-}
 
-// stealFrom 은 다른 P 의 runq 에서 task 의 절반을 훔쳐 온다.
-// runnext 슬롯은 훔치지 않는다. 이것이 핵심이다. runnext 는 생성자 P 만 쓸 수 있다.
-// 훔친 task 들 중 첫 번째는 곧바로 반환하고, 나머지는 내 runq 에 넣는다.
-func (s *scheduler) stealFrom(p *processor) *task {
-	// 실제 런타임은 랜덤한 P 부터 시도하지만 여기서는 순회한다.
-	for _, other := range s.procs {
-		if other == p {
-			continue
-		}
-		other.mu.Lock()
-		n := len(other.runq)
-		if n > 1 { // 최소 2개일 때 절반을 훔친다. 1개면 훔치지 않는다.
-			stealCount := n / 2
-			stolen := make([]*task, stealCount)
-			copy(stolen, other.runq[:stealCount])
-			other.runq = other.runq[stealCount:]
-			other.mu.Unlock()
+	res := LatencyResult{
+		Mode:    mode,
+		HotTick: -1,
+	}
 
-			p.mu.Lock()
-			// 훔친 task 중 첫 번째는 호출자에게 주고 나머지는 내 runq 에 넣는다.
-			if len(stolen) > 1 {
-				p.runq = append(p.runq, stolen[1:]...)
+	tick := 0
+	for tick < 100 {
+		// P0이 local work를 하나 실행한다.
+		if t, ok := p0.popLocal(); ok {
+			res.Events = append(res.Events, TraceEvent{tick, 0, t.ID, "run"})
+			if t.ID == hotTaskID {
+				res.HotTick = tick
+				break
 			}
-			p.steals += stealCount
-			p.mu.Unlock()
-			return stolen[0]
+			if t.ID == triggerTaskID {
+				// 첫 tick에서 hot task를 만들어 낸다.
+				p0.enqueue(mode, Task{ID: hotTaskID, Producer: 0})
+				res.Events = append(res.Events, TraceEvent{tick, 0, hotTaskID, fmt.Sprintf("enqueue via %s", mode)})
+			}
 		}
-		other.mu.Unlock()
-	}
-	return nil
-}
 
-// findRunnable 은 실행할 task 를 찾는다. 실제 런타임의 findrunnable 과 같은 역할이다.
-// 1. 자신의 runnext, runq 확인
-// 2. 전역 큐 확인
-// 3. 다른 P 에서 훔치기
-// 4. 없으면 nil (실제 런타임은 여기서 netpoll 확인, 스핀, sleep)
-func (s *scheduler) findRunnable(p *processor, useRunNext bool) *task {
-	if t := s.runqget(p, useRunNext); t != nil {
-		return t
-	}
-	if t := s.getFromGlobal(); t != nil {
-		return t
-	}
-	if t := s.stealFrom(p); t != nil {
-		return t
-	}
-	return nil
-}
-
-// worker 는 하나의 processor 를 맡아서 task 를 계속 실행하는 goroutine 이다.
-// remaining 은 아직 처리되지 않은 task 수를 atomic 으로 추적한다.
-// 모든 task 가 처리되면 worker 는 종료한다.
-func worker(s *scheduler, p *processor, remaining *int64, useRunNext bool, wg *sync.WaitGroup) {
-	defer wg.Done()
-	for {
-		t := s.findRunnable(p, useRunNext)
-		if t != nil {
-			t.executedOn = p.id // 이 task 가 어느 P 에서 실행됐는지 기록
-			_ = t.payload[0]    // 캐시 접근을 흉내내는 CPU 작업
-			p.mu.Lock()
-			p.processed++
-			p.mu.Unlock()
-			atomic.AddInt64(remaining, -1)
+		// P1이 local work를 하나 실행하거나, idle이면 P0에서 훔친다.
+		if t, ok := p1.popLocal(); ok {
+			res.Events = append(res.Events, TraceEvent{tick, 1, t.ID, "run"})
+			if t.ID == hotTaskID {
+				res.HotTick = tick
+				break
+			}
+			if t.ID == triggerTaskID {
+				p1.enqueue(mode, Task{ID: hotTaskID, Producer: 1})
+				res.Events = append(res.Events, TraceEvent{tick, 1, hotTaskID, fmt.Sprintf("enqueue via %s", mode)})
+			}
 		} else {
-			if atomic.LoadInt64(remaining) == 0 {
-				return
+			// P1이 idle이다. 실제 런타임은 fastrand로 희생 P를 고르지만,
+			// 여기서는 P가 두 개뿐이므로 P0을 고른다.
+			stolen := p1.stealHalf(p0)
+			if len(stolen) > 0 {
+				res.Stolen += len(stolen)
+				first := stolen[0]
+				// 실제 runqsteal은 훔친 batch 중 하나를 즉시 실행하고
+				// 나머지를 자신의 runq tail에 붙인다.
+				res.Events = append(res.Events, TraceEvent{tick, 1, first.ID, fmt.Sprintf("steal+run first, stole %d", len(stolen))})
+				if first.ID == hotTaskID {
+					res.HotTick = tick
+					break
+				}
+				if first.ID == triggerTaskID {
+					p1.enqueue(mode, Task{ID: hotTaskID, Producer: 1})
+				}
+				p1.Runq = append(p1.Runq, stolen[1:]...)
+			} else if p0.Runnext != nil {
+				// 실제 runqgrab은 runq가 비었을 때만 runnext를 훔친다.
+				// 이 시나리오에서는 P0 runq가 항상 남아 있어 실행되지 않는다.
+				// 하지만 runnext가 있는데 runq만 비어 있는 경우를 대비해
+				// 코드 위치를 남겨 둔다.
 			}
-			// 할 일이 없으면 잠시 쉬었다가 다시 찾는다.
-			// 실제 런타임은 스핀을 하다가 netpoll 을 확인하고, 그래도 없으면 잠든다.
-			time.Sleep(time.Microsecond)
 		}
+
+		tick++
 	}
+
+	return res
 }
 
-// runWorkStealingDemo 는 불균등하게 task 를 P0 에 몰아 넣고,
-// 다른 P 들이 work stealing 을 통해 일을 가져가는 모습을 보여준다.
-// useRunNext 가 true 이면 runnext 슬롯을 사용하고, false 이면 사용하지 않는다.
-// 반환값은 각 P 가 처리한 task 수와 전체 처리 수다.
-func runWorkStealingDemo(useRunNext bool, numTasks, numP int) ([]int, int) {
-	s := newScheduler(numP)
-	remaining := int64(numTasks)
-
-	// 모든 task 를 P0 의 로컬 큐에만 넣는다. 이것이 불균등 분배의 시작이다.
-	for i := 0; i < numTasks; i++ {
-		t := &task{id: i}
-		s.runqput(s.procs[0], t, useRunNext)
-	}
-
-	var wg sync.WaitGroup
-	for _, p := range s.procs {
-		wg.Add(1)
-		go worker(s, p, &remaining, useRunNext, &wg)
-	}
-	wg.Wait()
-
-	processed := make([]int, numP)
-	for i, p := range s.procs {
-		p.mu.Lock()
-		processed[i] = p.processed
-		p.mu.Unlock()
-	}
-	return processed, numTasks
+func printRuntimeInfo() {
+	fmt.Println("Go scheduler work stealing + runnext 관찰 모델")
+	fmt.Printf("GOMAXPROCS=%d NumCPU=%d\n", runtime.GOMAXPROCS(0), runtime.NumCPU())
+	fmt.Println("이 모델은 P 2개짜리 결정적 시나리오로 runnext가 hot task 지연을 줄이는 모습을 보여줍니다.")
+	fmt.Println("실제 런타임의 schedtrace를 보려면: GODEBUG=schedtrace=1000 go run .")
 }
 
-// runNextAffinityDemo 는 runnext 슬롯이 "같은 P 에서 실행되는 비율"을 높이는지
-// 확인한다. useRunNext 가 true 인 경우와 false 인 경우를 각각 실행해서,
-// task 가 원래 넣은 P0 에서 실행된 비율을 반환한다.
-func runNextAffinityDemo(numTasks, numP int) (samePWith, samePWithout int) {
-	// runnext 사용 O
-	processed, _ := runWorkStealingDemo(true, numTasks, numP)
-	samePWith = processed[0] // P0 에서 실행된 task 수 = 같은 P 실행 수
-
-	// runnext 사용 X
-	processed2, _ := runWorkStealingDemo(false, numTasks, numP)
-	samePWithout = processed2[0]
-
-	return samePWith, samePWithout
-}
-
-// measureRunNextLatency 는 runqput -> runqget 왕복 시간을 runnext 사용 유무에 따라
-// 측정한다. 실제 runnext 의 주 목적은 지연 시간 자체보다는 "같은 P 에서 즉시 실행"이지만,
-// 여기서는 로컬 큐 조작 비용의 차이를 보여준다.
-func measureRunNextLatency(numOps int) (withRunNext, withoutRunNext time.Duration) {
-	s := newScheduler(1)
-	p := s.procs[0]
-
-	start := time.Now()
-	for i := 0; i < numOps; i++ {
-		t := &task{id: i}
-		s.runqput(p, t, true)
-		_ = s.runqget(p, true)
+func printResult(r LatencyResult) {
+	fmt.Printf("\n[%s mode]\n", r.Mode)
+	for _, e := range r.Events {
+		fmt.Println("  ", e.String())
 	}
-	withRunNext = time.Since(start)
-
-	start = time.Now()
-	for i := 0; i < numOps; i++ {
-		t := &task{id: i}
-		s.runqput(p, t, false)
-		_ = s.runqget(p, false)
-	}
-	withoutRunNext = time.Since(start)
-
-	return withRunNext, withoutRunNext
-}
-
-// printSchedulerTraceHint 는 실제 Go 런타임 스케줄러 추적을 보는 방법을 출력한다.
-// main.go 의 시뮬레이션과 달리, 실제 런타임은 GODEBUG=schedtrace 로 관찰할 수 있다.
-func printSchedulerTraceHint() {
-	fmt.Println("--- 실제 Go 런타임 스케줄러 추적 ---")
-	fmt.Println("이 프로그램은 런타임 내부를 축소한 시뮬레이션을 돌려서")
-	fmt.Println("work stealing 과 runnext 의 동작을 눈으로 보여준다.")
-	fmt.Println("실제 Go 런타임의 스케줄러 상태를 보려면 아래처럼 실행하라:")
-	fmt.Println("  GODEBUG=schedtrace=1000 go run .")
-	fmt.Println("그러면 각 P 의 runqueue 길이와 runnext 유무가 주기적으로 출력된다.")
-	fmt.Println()
+	fmt.Printf("hot task(#%d) executed at tick=%d, stolen tasks=%d\n", hotTaskID, r.HotTick, r.Stolen)
 }
 
 func main() {
-	// 시뮬레이션에 사용할 task 수와 P 수.
-	// 실제 Go 런타임의 work stealing 은 수십만 goroutine 에서 의미가 있지만,
-	// 여기서는 관찰을 위해 작은 수로 줄였다.
-	numTasks := 20000
-	numP := 4
+	printRuntimeInfo()
 
-	printSchedulerTraceHint()
+	fifo := runHotLatency(QueueFIFO)
+	runnext := runHotLatency(QueueRunnext)
 
-	fmt.Println("=== work stealing 데모: P0 에만 task 몰아넣기 ===")
-	processedWith, total := runWorkStealingDemo(true, numTasks, numP)
-	fmt.Printf("runnext 사용 O: 전체 %d task 처리, P별 처리 수 = %v\n", total, processedWith)
-	processedWithout, total2 := runWorkStealingDemo(false, numTasks, numP)
-	fmt.Printf("runnext 사용 X: 전체 %d task 처리, P별 처리 수 = %v\n", total2, processedWithout)
-	fmt.Println("해석: runnext 사용 시 P0 이 처리하는 비율이 높고, X 일 때는 절반 이상이 다른 P 로 훔쳐간다.")
+	printResult(fifo)
+	printResult(runnext)
+
 	fmt.Println()
-
-	fmt.Println("=== runnext affinity 데모: 같은 P 에서 실행되는 비율 ===")
-	samePWith, samePWithout := runNextAffinityDemo(numTasks, numP)
-	fmt.Printf("runnext 사용 O: P0 에서 실행된 task 수 = %d / %d (%.1f%%)\n", samePWith, numTasks, float64(samePWith)/float64(numTasks)*100)
-	fmt.Printf("runnext 사용 X: P0 에서 실행된 task 수 = %d / %d (%.1f%%)\n", samePWithout, numTasks, float64(samePWithout)/float64(numTasks)*100)
-	fmt.Println("해석: runnext 슬롯은 새로 만든 task 가 다른 P 로 빼앗기지 않도록 보호한다.")
-	fmt.Println()
-
-	fmt.Println("=== runnext 로컬 큐 조작 지연 비교 ===")
-	withLat, withoutLat := measureRunNextLatency(100000)
-	fmt.Printf("runnext 사용 O: %v (100000회 put/get)\n", withLat)
-	fmt.Printf("runnext 사용 X: %v (100000회 put/get)\n", withoutLat)
-	fmt.Println("해석: runnext 는 단일 슬롯이라 put/get 이 O(1)로 끝나고, runq 슬라이스 조작보다 캐시 지역성이 좋다.")
-	fmt.Println()
-
-	fmt.Println("=== 실제 런타임 schedtrace 로 확인하기 ===")
-	fmt.Println("아래 명령을 별도 터미널에서 실행하면 P 별 runqueue 길이와 runnext 유무가 보인다.")
-	fmt.Println("  GODEBUG=schedtrace=1000 go run .")
-	fmt.Println("  # 위 명령은 이 프로그램을 다시 실행하면서 스케줄러 추적을 표준 에러로 출력한다.")
+	fmt.Println("해석:")
+	fmt.Println("  runnext가 있으면 hot task가 한 tick 만에 같은 P에서 실행된다.")
+	fmt.Println("  FIFO만 있으면 hot task가 runq tail에 붙어 앞선 작업들이 처리될 때까지 기다린다.")
 }
