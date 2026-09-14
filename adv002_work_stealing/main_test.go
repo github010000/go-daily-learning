@@ -1,115 +1,86 @@
 package main
 
-import (
-	"sync"
-	"testing"
-)
+import "testing"
 
-// TestRunqputRunNext 는 runnext 슬롯이 비어 있을 때 runqput 이 runnext 에
-// task 를 넣고, runqget 이 그 task 를 우선 반환하는지 검증한다.
-func TestRunqputRunNext(t *testing.T) {
-	s := newScheduler(1)
-	p := s.procs[0]
-	task1 := &task{id: 1}
-	task2 := &task{id: 2}
+// TestEnqueueRunnextMovesOldSlotToRunq는 runnext의 기본 불변식을 검증한다.
+// 새 작업이 runnext에 들어가면 기존 runnext는 runq tail로 밀려나고,
+// popLocal은 runnext를 가장 먼저 꺼내야 한다.
+func TestEnqueueRunnextMovesOldSlotToRunq(t *testing.T) {
+	p := newProc(0)
 
-	s.runqput(p, task1, true)
-	s.runqput(p, task2, true) // runnext 가 차 있으므로 runq 로 간다.
+	p.enqueue(QueueRunnext, Task{ID: 1, Producer: 0})
+	p.enqueue(QueueRunnext, Task{ID: 2, Producer: 0})
 
-	got := s.runqget(p, true)
-	if got != task1 {
-		t.Fatalf("runnext 우선 실행 실패: got id=%d, want id=1", got.id)
+	// runnext에는 가장 최근 작업인 2가 있어야 한다.
+	if p.Runnext == nil || p.Runnext.ID != 2 {
+		t.Fatalf("runnext should be task 2, got %+v", p.Runnext)
 	}
-	got = s.runqget(p, true)
-	if got != task2 {
-		t.Fatalf("runnext 소진 후 runq 에서 꺼내기 실패: got id=%d, want id=2", got.id)
-	}
-}
-
-// TestStealFromDoesNotTouchRunnext 는 work stealing 이 다른 P 의 runnext 슬롯을
-// 훔치지 않고, runq 에서만 절반을 훔치는지 검증한다.
-func TestStealFromDoesNotTouchRunnext(t *testing.T) {
-	s := newScheduler(2)
-	p0 := s.procs[0]
-	p1 := s.procs[1]
-
-	// p0 의 runnext 에 task A, runq 에 task B, C 를 넣는다.
-	taskA := &task{id: 10}
-	taskB := &task{id: 20}
-	taskC := &task{id: 30}
-	s.runqput(p0, taskA, true) // runnext 로
-	s.runqput(p0, taskB, true) // runnext 차 있으므로 runq 에 taskB
-	s.runqput(p0, taskC, true) // runq 에 taskC
-
-	// p1 이 p0 에서 훔친다. runq 길이는 2개이므로 절반인 1개를 훔친다.
-	stolen := s.stealFrom(p1)
-	if stolen == nil {
-		t.Fatal("stealFrom 이 nil 을 반환했다")
+	// 기존 runnext였던 1은 runq tail로 밀려났어야 한다.
+	if len(p.Runq) != 1 || p.Runq[0].ID != 1 {
+		t.Fatalf("runq should contain task 1, got %+v", p.Runq)
 	}
 
-	// 훔친 task 는 runq 에 있던 B 또는 C 여야 한다. runnext 의 A는 훔치면 안 된다.
-	if stolen == taskA {
-		t.Fatalf("runnext 슬롯의 task 를 훔쳤다: id=%d", stolen.id)
+	p.enqueue(QueueRunnext, Task{ID: 3, Producer: 0})
+	if p.Runnext == nil || p.Runnext.ID != 3 {
+		t.Fatalf("runnext should be task 3, got %+v", p.Runnext)
 	}
-	if stolen != taskB && stolen != taskC {
-		t.Fatalf("알 수 없는 task 를 훔쳤다: id=%d", stolen.id)
+	if len(p.Runq) != 2 || p.Runq[0].ID != 1 || p.Runq[1].ID != 2 {
+		t.Fatalf("runq should be [1 2], got %+v", p.Runq)
 	}
 
-	// p0 에는 runnext 의 A 와 runq 에 남은 하나가 있어야 한다.
-	p0.mu.Lock()
-	defer p0.mu.Unlock()
-	if p0.runnext != taskA {
-		t.Fatalf("p0.runnext 가 유지되지 않았다: %v", p0.runnext)
+	// popLocal은 runnext를 먼저 꺼내므로 3, 1, 2 순서가 되어야 한다.
+	got, ok := p.popLocal()
+	if !ok || got.ID != 3 {
+		t.Fatalf("first pop should be task 3, got %+v ok=%v", got, ok)
 	}
-	if len(p0.runq) != 1 {
-		t.Fatalf("p0.runq 길이가 1이 아니고 %d 이다", len(p0.runq))
+	got, ok = p.popLocal()
+	if !ok || got.ID != 1 {
+		t.Fatalf("second pop should be task 1, got %+v ok=%v", got, ok)
+	}
+	got, ok = p.popLocal()
+	if !ok || got.ID != 2 {
+		t.Fatalf("third pop should be task 2, got %+v ok=%v", got, ok)
 	}
 }
 
-// TestWorkStealingDistribution 은 불균등하게 넣은 task 가 모든 P 에 분산되어
-// 처리되고, 전체 처리 수가 정확히 numTasks 와 같은지 검증한다.
-func TestWorkStealingDistribution(t *testing.T) {
-	numTasks := 200
-	numP := 4
+// TestRunnextReducesHotTaskLatency는 같은 시나리오에서 runnext 모드가
+// hot task를 더 일찍 실행하는지 검증한다.
+// FIFO 모드에서는 hot task가 runq tail에서 대기하기 때문에 더 늦게 실행된다.
+func TestRunnextReducesHotTaskLatency(t *testing.T) {
+	fifo := runHotLatency(QueueFIFO)
+	runnext := runHotLatency(QueueRunnext)
 
-	processed, total := runWorkStealingDemo(true, numTasks, numP)
-
-	if total != numTasks {
-		t.Fatalf("전체 처리 수 불일치: got %d, want %d", total, numTasks)
+	if fifo.HotTick < 0 || runnext.HotTick < 0 {
+		t.Fatal("hot task was not executed")
 	}
-
-	sum := 0
-	for _, n := range processed {
-		sum += n
-		if n < 0 {
-			t.Fatalf("처리 수가 음수: %d", n)
-		}
+	if runnext.HotTick >= fifo.HotTick {
+		t.Fatalf("runnext should reduce latency, runnext tick=%d fifo tick=%d", runnext.HotTick, fifo.HotTick)
 	}
-	if sum != numTasks {
-		t.Fatalf("P 별 처리 수 합이 전체와 다르다: sum=%d, want=%d", sum, numTasks)
-	}
-
-	// P0 에만 몰아넣었으므로, work stealing 이 일어나면 다른 P 도 0보다 커야 한다.
-	// 단, 아주 작은 확률로 P0 가 전부 처리할 수도 있지만 200개 정도면 사실상
-	// 다른 P 도 처리한다. 여기서는 불변식만 약하게 확인한다.
-	if processed[0] == numTasks {
-		t.Log("경고: P0 가 모든 task 를 처리했다. work stealing 이 일어나지 않았을 수 있다.")
+	if fifo.Stolen < 1 {
+		t.Fatalf("FIFO scenario should involve stealing, got %d", fifo.Stolen)
 	}
 }
 
-// BenchmarkRunNextLatency 는 runnext 유무에 따른 runqput/runqget 왕복 비용을
-// 비교한다. b.ResetTimer 는 초기화 작업이 측정에 포함되지 않도록 배치했다.
-func BenchmarkRunNextLatency(b *testing.B) {
-	for _, useRunNext := range []bool{true, false} {
-		b.Run(map[bool]string{true: "withRunNext", false: "withoutRunNext"}[useRunNext], func(b *testing.B) {
-			s := newScheduler(1)
-			p := s.procs[0]
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				t := &task{id: i}
-				s.runqput(p, t, useRunNext)
-				_ = s.runqget(p, useRunNext)
-			}
-		})
+// TestStealHalfTakesHeadBatch는 도둑 P가 희생 P의 runq 앞쪽 절반(올림)을
+// 가져오는지 확인한다. Go 런타임은 runqgrab에서 n - n/2 공식을 사용한다.
+func TestStealHalfTakesHeadBatch(t *testing.T) {
+	victim := newProc(0)
+	for i := 1; i <= 5; i++ {
+		victim.Runq = append(victim.Runq, Task{ID: i, Producer: 0})
+	}
+
+	thief := newProc(1)
+	stolen := thief.stealHalf(victim)
+
+	// 5개 중 올림 절반은 3개다.
+	if len(stolen) != 3 {
+		t.Fatalf("steal half of 5 should be 3, got %d", len(stolen))
+	}
+	// runq head에서 훔쳐야 하므로 1,2,3이 stolen이어야 한다.
+	if stolen[0].ID != 1 || stolen[1].ID != 2 || stolen[2].ID != 3 {
+		t.Fatalf("stolen batch should be [1 2 3], got %+v", stolen)
+	}
+	if len(victim.Runq) != 2 || victim.Runq[0].ID != 4 || victim.Runq[1].ID != 5 {
+		t.Fatalf("victim should have [4 5], got %+v", victim.Runq)
 	}
 }
