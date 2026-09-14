@@ -1,112 +1,54 @@
 package main
 
 import (
-	"sync"
+	"runtime"
 	"sync/atomic"
 	"testing"
 	"time"
 )
 
-// TestBlockingSyscallWorker는 블로킹 syscall 고루틴이 정확한 횟수만큼
-// syscall을 호출하는지 검증한다. duration을 짧게 주어 테스트를 빠르게 한다.
-func TestBlockingSyscallWorker(t *testing.T) {
-	var wg sync.WaitGroup
+// TestGoodBlockingSyscallReturns 는 goodBlockingSyscall 이 정상적으로 반환하는지 확인한다.
+// syscall.Select 경로가 P handoff 과 관계없이 제어를 반환하는지 검증한다.
+func TestGoodBlockingSyscallReturns(t *testing.T) {
+	goodBlockingSyscall(1 * time.Millisecond)
+}
+
+// TestBadBlockingSyscallReturns 는 badBlockingSyscall 이 반환하는지 확인한다.
+// RawSyscall6 경로가 프로세스를 멈추지 않도록 회귀 테스트한다.
+func TestBadBlockingSyscallReturns(t *testing.T) {
+	badBlockingSyscall(1 * time.Millisecond)
+}
+
+// TestSpinCounterIncrementsAndStops 는 spinCounter 가 count 를 올리고 stop 채널을 받으면
+// 정상 종료하는지 검증한다. 시간 단정 대신 count 가 0 인 동안 runtime.Gosched 로
+// 스케줄러를 양보해 실제 실행을 기다린다.
+func TestSpinCounterIncrementsAndStops(t *testing.T) {
 	var count int64
-	iters := 20
-	duration := 1 * time.Millisecond
+	stop, done := startSpinWorker(&count)
 
-	wg.Add(1)
-	go blockingSyscallWorker(0, duration, iters, &wg, &count)
-	wg.Wait()
+	for atomic.LoadInt64(&count) == 0 {
+		runtime.Gosched()
+	}
+	close(stop)
+	<-done
 
-	if atomic.LoadInt64(&count) != int64(iters) {
-		t.Fatalf("expected %d syscalls, got %d", iters, count)
+	if atomic.LoadInt64(&count) == 0 {
+		t.Fatalf("spinCounter did not increment")
 	}
 }
 
-// TestCPUWorker는 cpuBoundWorker가 계산을 정확히 누적하는지 검증한다.
-// progress가 0보다 크고, result가 기대 합과 일치해야 한다.
-func TestCPUWorker(t *testing.T) {
-	var wg sync.WaitGroup
-	var progress int64
-	var result int64
-	iters := 10000
-
-	wg.Add(1)
-	go cpuBoundWorker(0, iters, &wg, &progress, &result)
-	wg.Wait()
-
-	expected := int64(0)
-	for i := 0; i < iters; i++ {
-		expected += int64(i) * 2
-	}
-
-	if atomic.LoadInt64(&result) != expected {
-		t.Fatalf("expected result %d, got %d", expected, result)
-	}
-	if atomic.LoadInt64(&progress) <= 0 {
-		t.Fatalf("expected progress > 0, got %d", progress)
-	}
-}
-
-// TestConcurrentWorkers는 블로킹 syscall 고루틴과 CPU 바운드 고루틴을
-// 동시에 실행했을 때 race 없이 모든 작업이 완료되는지 확인한다.
-// 이는 -race 플래그로 실행해도 통과해야 한다.
-func TestConcurrentWorkers(t *testing.T) {
-	var wg sync.WaitGroup
-	var syscallCount int64
-	var cpuProgress int64
-	var cpuResult int64
-
-	syscallIters := 5
-	cpuIters := 1000
-	duration := 1 * time.Millisecond
-
-	wg.Add(3)
-	go blockingSyscallWorker(1, duration, syscallIters, &wg, &syscallCount)
-	go cpuBoundWorker(1, cpuIters, &wg, &cpuProgress, &cpuResult)
-	go cpuBoundWorker(2, cpuIters, &wg, &cpuProgress, &cpuResult)
-	wg.Wait()
-
-	if atomic.LoadInt64(&syscallCount) != int64(syscallIters) {
-		t.Fatalf("expected %d syscalls, got %d", syscallIters, syscallCount)
-	}
-	expectedCPU := int64(0)
-	for i := 0; i < cpuIters; i++ {
-		expectedCPU += int64(i) * 2
-	}
-	expectedTotal := expectedCPU * 2 // 두 CPU 고루틴
-	if atomic.LoadInt64(&cpuResult) != expectedTotal {
-		t.Fatalf("expected total CPU result %d, got %d", expectedTotal, cpuResult)
-	}
-	if atomic.LoadInt64(&cpuProgress) <= 0 {
-		t.Fatalf("expected cpu progress > 0, got %d", cpuProgress)
-	}
-}
-
-// BenchmarkBlockingSyscallWorker는 syscall 고루틴의 반복 비용을 측정한다.
-func BenchmarkBlockingSyscallWorker(b *testing.B) {
-	var count int64
-	duration := 1 * time.Microsecond
-	b.ResetTimer()
+// BenchmarkGoodBlockingSyscall 은 P handoff 가 일어나는 syscall.Select 의 반복 비용을 잰다.
+// entersyscall/exitsyscall 전환 오버헤드를 포함한 syscall 비용을 관찰하기 위한 벤치마크다.
+func BenchmarkGoodBlockingSyscall(b *testing.B) {
 	for i := 0; i < b.N; i++ {
-		var wg sync.WaitGroup
-		wg.Add(1)
-		go blockingSyscallWorker(0, duration, 1, &wg, &count)
-		wg.Wait()
+		goodBlockingSyscall(1 * time.Microsecond)
 	}
 }
 
-// BenchmarkCPUWorker는 CPU 바운드 작업의 성능을 측정한다.
-func BenchmarkCPUWorker(b *testing.B) {
-	var progress int64
-	var result int64
-	iters := 1000
-	b.ResetTimer()
+// BenchmarkBadBlockingSyscall 은 RawSyscall6 인 select 의 반복 비용을 잰다.
+// handoff 없이 M 이 블로킹되는 비용을 비교할 수 있다.
+func BenchmarkBadBlockingSyscall(b *testing.B) {
 	for i := 0; i < b.N; i++ {
-		var wg sync.WaitGroup
-		wg.Add(1)
-		go cpuBoundWorker(0, iters, &wg, &progress, &result)
-		wg.Wait()
+		badBlockingSyscall(1 * time.Microsecond)
 	}
 }
