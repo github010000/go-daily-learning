@@ -1,141 +1,205 @@
 package main
 
 import (
-    "fmt"
-    "net"
-    "runtime"
-    "strings"
-    "sync/atomic"
+	"fmt"
+	"net"
+	"os"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
 )
 
-// networkParkDemo는 parkNetworkReads가 만든 TCP 연결 묶음이다.
-type networkParkDemo struct {
-    listener net.Listener
-    clients  []net.Conn
-    servers  []net.Conn
+type snapshot struct {
+	goroutines int
+	threads    int
 }
 
-// close는 지금까지 연 모든 연결을 닫아서 Read에 park되어 있던 goroutine이
-// 정상적으로 언블록되고 종료되게 한다.
-func (d *networkParkDemo) close() {
-    for _, c := range d.clients {
-        if c != nil {
-            _ = c.Close()
-        }
-    }
-    for _, c := range d.servers {
-        if c != nil {
-            _ = c.Close()
-        }
-    }
-    if d.listener != nil {
-        _ = d.listener.Close()
-    }
-}
-
-// countStackNeedle은 모든 goroutine의 스택 트레이스에서 needle이 몇 번 나오는지 센다.
-// netpoller에 park된 goroutine은 스택에 internal/poll.(*FD).Read가 남는다.
-func countStackNeedle(needle string) int {
-    buf := make([]byte, 4<<20)
-    n := runtime.Stack(buf, true)
-    return strings.Count(string(buf[:n]), needle)
-}
-
-func waitUntil(cond func() bool, maxIter int) bool {
-    for i := 0; i < maxIter; i++ {
-        if cond() {
-            return true
-        }
-        runtime.Gosched()
-    }
-    return false
-}
-
-func waitForStackNeedle(needle string, minCount, maxIter int) bool {
-    return waitUntil(func() bool {
-        return countStackNeedle(needle) >= minCount
-    }, maxIter)
-}
-
-// parkNetworkReads는 n개의 TCP 연결을 만들고 각 서버 goroutine이
-// net.Conn.Read에서 park될 때까지 기다린다. 네트워크 fd는 항상 논블로킹이므로
-// Read는 EAGAIN을 만나면 netpoller에게 goroutine을 맡기고 M을 반환한다.
-func parkNetworkReads(n int) (*networkParkDemo, error) {
-    ln, err := net.Listen("tcp", "127.0.0.1:0")
-    if err != nil {
-        return nil, err
-    }
-    d := &networkParkDemo{listener: ln}
-
-    for i := 0; i < n; i++ {
-        client, err := net.Dial("tcp", ln.Addr().String())
-        if err != nil {
-            d.close()
-            return nil, err
-        }
-        server, err := ln.Accept()
-        if err != nil {
-            d.close()
-            return nil, err
-        }
-        d.clients = append(d.clients, client)
-        d.servers = append(d.servers, server)
-
-        go func(c net.Conn) {
-            buf := make([]byte, 1)
-            _, _ = c.Read(buf)
-        }(server)
-    }
-
-    // 스택을 직접 검사해서 실제로 park됐는지 확인한다. sleep 같은 시간 기반
-    // 대기를 쓰지 않아 테스트와 시연이 결정적이다.
-    if !waitForStackNeedle("internal/poll.(*FD).Read", n, 100000) {
-        d.close()
-        return nil, fmt.Errorf("%d goroutine이 network read에 park되지 않았음", n)
-    }
-    return d, nil
-}
-
-// runCPUWorkUntilTarget은 CPU만 쓰는 goroutine을 하나 띄우고 target까지 도달하기를
-// 기다린다. netpoller가 G만 재우고 M을 반환했다면 GOMAXPROCS=1에서도 이 함수가
-// target을 채울 수 있어야 한다.
-func runCPUWorkUntilTarget(target int64) int64 {
-    var counter int64
-    go func() {
-        for atomic.LoadInt64(&counter) < target {
-            atomic.AddInt64(&counter, 1)
-        }
-    }()
-
-    waitUntil(func() bool {
-        return atomic.LoadInt64(&counter) >= target
-    }, 10000000)
-
-    return atomic.LoadInt64(&counter)
+type connStart struct {
+	c   net.Conn
+	err error
 }
 
 func main() {
-    // 의도적으로 P를 하나만 둔다. 그래야 network read가 M을 막는다면
-    // CPU worker가 전혀 진행되지 못하므로 netpoller 효과가 눈에 보인다.
-    runtime.GOMAXPROCS(1)
-    fmt.Println("GOMAXPROCS:", runtime.GOMAXPROCS(0))
+	// GOMAXPROCS=1 로 고정해야 차이가 극명하게 보인다.
+	// P 가 하나뿐이면 netpoller 는 M 을 해방시키고,
+	// raw blocking syscall 은 M 을 소모해 새 M 을 만들어야 하기 때문이다.
+	old := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(old)
 
-    demo, err := parkNetworkReads(5)
-    if err != nil {
-        panic(err)
-    }
-    defer demo.close()
+	const n = 100
 
-    fmt.Println("parked network reads: 5")
-    fmt.Println("runtime.NumGoroutine:", runtime.NumGoroutine())
-    fmt.Println("runtime.NumThread before CPU work:", runtime.NumThread())
+	fmt.Println("netpoller 시연: GOMAXPROCS=1, blocking I/O 100개")
+	fmt.Println("두 시나리오를 순서대로 측정합니다...")
 
-    const target = 1_000_000
-    fmt.Println("CPU work target:", target)
-    got := runCPUWorkUntilTarget(target)
-    fmt.Println("CPU work reached:", got)
-    fmt.Println("runtime.NumThread after CPU work:", runtime.NumThread())
+	netBefore, netAfter := blockOnNetpoll(n, 50*time.Millisecond)
+	fmt.Printf("[net.Conn.Read] %d개 블로킹\n", n)
+	fmt.Printf("  goroutine: %d -> %d\n", netBefore.goroutines, netAfter.goroutines)
+	fmt.Printf("  OS 스레드: %d -> %d\n", netBefore.threads, netAfter.threads)
+	fmt.Println("  -> goroutine은 늘어도 M은 거의 늘지 않는다. (netpoller가 fd를 대기)")
 
-    // 출력에서 핵심: GOMAXPROCS=1인데도 5개 Read가 park된 상태에서
-    // CPU work target이 채워진다. 만약 Read가 M을 블로킹했다면 target은 0에 머문다.
+	rawBefore, rawAfter := blockOnRawSyscallPipe(n, 50*time.Millisecond)
+	fmt.Printf("[raw syscall.Read] %d개 블로킹 (일반 파일 I/O와 같은 blocking 경로)\n", n)
+	fmt.Printf("  goroutine: %d -> %d\n", rawBefore.goroutines, rawAfter.goroutines)
+	fmt.Printf("  OS 스레드: %d -> %d\n", rawBefore.threads, rawAfter.threads)
+	fmt.Println("  -> M까지 커널에서 잠들어 런타임이 새 M을 계속 만든다.")
+
+	fmt.Println("결론: net.Conn 계열은 그냥 blocking read를 써도 된다.")
+	fmt.Println("      raw syscall이나 일반 파일 Read는 같은 느낌이지만 M을 소모할 수 있다.")
+}
+
+func blockOnNetpoll(n int, settle time.Duration) (snapshot, snapshot) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "listen:", err)
+		return snapshot{runtime.NumGoroutine(), currentThreads()}, snapshot{runtime.NumGoroutine(), currentThreads()}
+	}
+
+	accepted := make(chan net.Conn, n)
+	acceptDone := make(chan struct{})
+	go func() {
+		defer close(acceptDone)
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			accepted <- c
+		}
+	}()
+
+	started := make(chan connStart, n)
+	var mu sync.Mutex
+	clients := make([]net.Conn, 0, n)
+	var wg sync.WaitGroup
+
+	before := snapshot{runtime.NumGoroutine(), currentThreads()}
+
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c, err := net.Dial("tcp", ln.Addr().String())
+			if err != nil {
+				started <- connStart{err: err}
+				return
+			}
+			mu.Lock()
+			clients = append(clients, c)
+			mu.Unlock()
+			started <- connStart{c: c}
+
+			var one [1]byte
+			// 여기가 핵심이다. netpoller 는 goroutine 만 park시키고
+			// M 은 런타임으로 돌아가 다른 일을 할 수 있게 만든다.
+			_, _ = c.Read(one[:])
+		}()
+	}
+
+	// 모든 클라이언트 goroutine 이 blocking Read 에 도달할 때까지 기다린다.
+	for i := 0; i < n; i++ {
+		<-started
+	}
+
+	if settle > 0 {
+		time.Sleep(settle)
+	}
+	after := snapshot{runtime.NumGoroutine(), currentThreads()}
+
+	// 클라이언트 쪽 연결을 닫아 블로킹된 Read 를 모두 깨운다.
+	mu.Lock()
+	for _, c := range clients {
+		_ = c.Close()
+	}
+	mu.Unlock()
+
+	// accept goroutine 이 Accept 에서 빠져나오도록 listener 를 닫는다.
+	_ = ln.Close()
+	wg.Wait()
+	<-acceptDone
+
+	// 서버 쪽 accepted 연결도 닫아 fd 를 반환한다.
+	close(accepted)
+	for c := range accepted {
+		_ = c.Close()
+	}
+
+	return before, after
+}
+
+func blockOnRawSyscallPipe(n int, settle time.Duration) (snapshot, snapshot) {
+	pipes := make([][2]int, n)
+	for i := 0; i < n; i++ {
+		if err := syscall.Pipe(pipes[i][:]); err != nil {
+			for j := 0; j < i; j++ {
+				_ = syscall.Close(pipes[j][0])
+				_ = syscall.Close(pipes[j][1])
+			}
+			fmt.Fprintln(os.Stderr, "pipe:", err)
+			return snapshot{runtime.NumGoroutine(), currentThreads()}, snapshot{runtime.NumGoroutine(), currentThreads()}
+		}
+	}
+
+	ready := make(chan struct{}, n)
+	var wg sync.WaitGroup
+
+	before := snapshot{runtime.NumGoroutine(), currentThreads()}
+
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(rfd int) {
+			defer wg.Done()
+			ready <- struct{}{}
+			var one [1]byte
+			// 이 raw syscall 은 M 을 커널에 묶어둔다.
+			// netpoller 를 타지 않기 때문에 thread 수가 늘어난다.
+			_, _ = syscall.Read(rfd, one[:])
+			_ = syscall.Close(rfd)
+		}(pipes[i][0])
+	}
+
+	// 모든 goroutine 이 ready 신호를 보낸 뒤 실제 syscall.Read 로
+	// 들어갈 시간을 준다.
+	for i := 0; i < n; i++ {
+		<-ready
+	}
+
+	if settle > 0 {
+		time.Sleep(settle)
+	}
+	after := snapshot{runtime.NumGoroutine(), currentThreads()}
+
+	// 쓰기 쪽 fd 에 바이트를 써서 read 를 깨운다.
+	for i := 0; i < n; i++ {
+		_, _ = syscall.Write(pipes[i][1], []byte{0})
+	}
+	wg.Wait()
+
+	for i := 0; i < n; i++ {
+		_ = syscall.Close(pipes[i][1])
+	}
+
+	return before, after
+}
+
+func currentThreads() int {
+	// /proc/self/status 에서 현재 OS 스레드 수를 읽는다.
+	// macOS 같은 비 리눅스 환경에서는 -1 을 반환한다.
+	data, err := os.ReadFile("/proc/self/status")
+	if err != nil {
+		return -1
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if !strings.HasPrefix(line, "Threads:") {
+			continue
+		}
+		v, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, "Threads:")))
+		if err != nil {
+			return -1
+		}
+		return v
+	}
+	return -1
 }
