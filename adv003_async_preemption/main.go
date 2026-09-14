@@ -3,109 +3,130 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"runtime"
+	"strings"
 	"time"
 )
 
-// sink 는 tight loop 가 값을 써 넣는 전역 변수다.
-// 함수 호출을 만들지 않으면서도 컴파일러가 루프를 제거하지 못하게 하는 역할이다.
-var sink int
+// demoIterations는 시연용 반복 횟수다.
+// 함수 호출이 없는 tight loop가 협조적 선점에서 왜 문제가 되는지
+// 충분히 오래 실행되도록 크게 잡는다.
+const demoIterations = 2_000_000_000
 
-// tightLoopNoYield 는 협조적 선점 지점(함수 호출)을 전혀 만들지 않는다.
-// 1.13까지는 이 루프가 P를 독점해 STW나 다른 goroutine 기아를 일으켰다.
-// 1.14부터는 비동기 선점이 시그널로 이 루프를 끊어낸다.
-func tightLoopNoYield() {
-	i := 0
-	for {
-		sink = i
-		i++
+// tightLoop는 의도적으로 어떤 함수도 호출하지 않는다.
+// Go 1.14 이전에는 이런 루프에 안전점이 없어서 GC의 stop-the-world가
+// 끝날 때까지 main goroutine이 기다려야 했다.
+func tightLoop(iterations uint64) uint64 {
+	var sum uint64
+	for i := uint64(0); i < iterations; i++ {
+		sum += i
 	}
+	return sum
 }
 
-// tightLoopWithYield 는 매 반복마다 runtime.Gosched()를 호출해
-// 협조적 선점 지점을 만든다. 비동기 선점이 없던 시절에는 이렇게
-// 양보 지점을 직접 넣어야 다른 goroutine이 실행될 수 있었다.
-func tightLoopWithYield() {
-	i := 0
-	for {
-		sink = i
-		i++
-		runtime.Gosched()
-	}
+// loopDemoResult는 runTightLoopDemo가 측정한 값을 모은다.
+type loopDemoResult struct {
+	sum          uint64
+	resume       time.Duration
+	total        time.Duration
+	stillRunning bool
 }
 
-// ticker 는 0..n-1 을 ch 로 보낸다.
-// GOMAXPROCS=1 이면 tight loop 가 먼저 실행되고 나서야
-// 이 함수가 실행 기회를 얻는다(비동기 선점이 없으면 영영 못 얻는다).
-func ticker(ch chan int, n int) {
-	for i := 0; i < n; i++ {
-		ch <- i
-	}
-}
-
-// runPreemptionDemo 는 GOMAXPROCS=1 환경에서
-//   - useYield=false: tight loop 가 preemption point 없이 계속 돌 때
-//   - useYield=true:  tight loop 가 Gosched 로 양보할 때
-// 다른 goroutine(ticker)이 진행되는지 관찰한다.
-//
-// 반환값:
-//   - ok: 10개의 값이 모두 수신되면 true, 시간 내 진행이 없으면 false
-//   - elapsed: 첫 수신을 시작한 시점부터 10개를 받기까지 걸린 시간
-//
-// 이 함수는 async preemption 이 꺼져 있으면 useYield=false 일 때
-// false 를 반환한다. 즉 GODEBUG=asyncpreemptoff=1 로 실행하면
-// 옛날(1.13 이전) 동작을 재현할 수 있다.
-func runPreemptionDemo(useYield bool) (ok bool, elapsed time.Duration) {
-	old := runtime.GOMAXPROCS(1)
-	defer runtime.GOMAXPROCS(old)
-
-	ch := make(chan int)
-
-	if useYield {
-		go tightLoopWithYield()
-	} else {
-		go tightLoopNoYield()
-	}
-
-	// ticker 는 0..9 를 ch 에 보낸다.
-	// GOMAXPROCS=1 이므로 tight loop 가 먼저 실행되고 나서야
-	// ticker 가 실행 기회를 얻는다. 비동기 선점이 없으면
-	// 이 goroutine 은 계속 run queue 에서 대기하게 된다.
-	go ticker(ch, 10)
-
+// runTightLoopDemo는 tightLoop를 별도 goroutine에서 실행하고,
+// runtime.Gosched로 양보한 뒤 main goroutine이 다시 스케줄링될 때까지
+// 걸린 시간을 측정한다. 호출 전에 GOMAXPROCS를 1로 설정해야
+// 하나의 P에서만 실행되어 선점 차이가 극명하게 드러난다.
+func runTightLoopDemo(iterations uint64) loopDemoResult {
+	done := make(chan uint64, 1)
 	start := time.Now()
-	count := 0
-	// 비동기 선점이 켜져 있으면 tight loop 가 10ms 주기로 선점되어
-	// ticker 가 보낸 값을 받을 수 있다. 넉넉히 1초를 주고,
-	// 그래도 진행이 없으면 false 를 반환한다(옛날 동작 재현).
-	timeout := time.After(1 * time.Second)
 
-	for count < 10 {
-		select {
-		case v := <-ch:
-			// v 는 0부터 9까지 증가한다.
-			count = v + 1
-		case <-timeout:
-			return false, time.Since(start)
-		}
+	go func() {
+		done <- tightLoop(iterations)
+	}()
+
+	// Gosched는 현재 goroutine을 run queue에 넣고 다른 goroutine을 고른다.
+	// 선점이 없으면 tightLoop가 끝날 때까지 여기서 반환되지 않는다.
+	runtime.Gosched()
+
+	resume := time.Since(start)
+
+	stillRunning := true
+	var sum uint64
+	select {
+	case sum = <-done:
+		stillRunning = false
+	default:
 	}
-	return true, time.Since(start)
+
+	if stillRunning {
+		sum = <-done
+	}
+
+	return loopDemoResult{
+		sum:          sum,
+		resume:       resume,
+		total:        time.Since(start),
+		stillRunning: stillRunning,
+	}
+}
+
+// printResult는 측정 결과를 보기 좋게 출력한다.
+func printResult(mode string, r loopDemoResult) {
+	fmt.Printf("[%s] main resumed after %v (tight loop still running: %v)\n",
+		mode, r.resume, r.stillRunning)
+	fmt.Printf("[%s] tight loop finished after %v, sum=%d\n",
+		mode, r.total, r.sum)
+}
+
+// childEnv는 기존 GODEBUG 값을 제거하고 asyncpreemptoff=1로 설정한 환경을
+// 반환한다. 단순히 append하면 중복 GODEBUG이 생겨 어떤 값이 적용될지
+// 명확하지 않으므로 명시적으로 교체한다.
+func childEnv() []string {
+	env := os.Environ()
+	out := make([]string, 0, len(env)+1)
+	for _, e := range env {
+		if strings.HasPrefix(e, "GODEBUG=") {
+			continue
+		}
+		out = append(out, e)
+	}
+	return append(out, "GODEBUG=asyncpreemptoff=1", "DEMO_CHILD=1")
 }
 
 func main() {
-	mode := "noyield"
-	if len(os.Args) > 1 {
-		mode = os.Args[1]
+	// GOMAXPROCS를 1로 설정해 tight loop와 main이 같은 P를 쓰게 한다.
+	// 그래야 협조적 선점이 없을 때 starvation이 재현된다.
+	runtime.GOMAXPROCS(1)
+
+	// 자식 모드로 실행되면 async preemption을 끈 상태만 시연하고 종료한다.
+	if os.Getenv("DEMO_CHILD") == "1" {
+		fmt.Println("== child: asynchronous preemption OFF ==")
+		result := runTightLoopDemo(demoIterations)
+		printResult("OFF", result)
+		return
 	}
 
-	useYield := mode == "yield"
-	ok, elapsed := runPreemptionDemo(useYield)
+	// 부모 모드에서는 먼저 async preemption이 켜진 상태로 시연한다.
+	fmt.Println("== parent: asynchronous preemption ON ==")
+	result := runTightLoopDemo(demoIterations)
+	printResult("ON", result)
 
-	fmt.Printf("mode=%s, progress=%v, elapsed=%v\n", mode, ok, elapsed)
-	if !ok {
-		fmt.Println("진행이 없습니다. 비동기 선점이 꺼져 있거나 tight loop 가 선점되지 않았습니다.")
-		fmt.Println("GODEBUG=asyncpreemptoff=1 로 실행하면 협조적 선점만 쓰던 1.13 이전 동작을 볼 수 있습니다.")
+	fmt.Println()
+	fmt.Println("spawning child with GODEBUG=asyncpreemptoff=1 ...")
+
+	exe, err := os.Executable()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "cannot find executable: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Println("진행 완료: tight loop 가 실행 중이어도 다른 goroutine 이 동작했습니다.")
+
+	cmd := exec.Command(exe)
+	cmd.Env = childEnv()
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "child failed: %v\n", err)
+		os.Exit(1)
+	}
 }
