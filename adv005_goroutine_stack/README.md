@@ -1,107 +1,76 @@
-# Goroutine 스택: 2KB에서 시작하는 이유
-
 ## 한 줄 요약
-Go는 각 goroutine이 **2KB의 작은 스택**으로 시작해, 필요에 따라 heap 메모리를 할당하며 **가변적으로 성장**합니다. 이는 수만 개의 goroutine이 동시에 존재해도 OS 메모리 부족으로 인한 오버헤드를 최소화하기 위한 설계입니다.
+
+goroutine stack 은 2KB 에서 시작하고, 필요할 때마다 더 큰 연속된 메모리로 통째로 복사되며, 함수가 반환되고 GC 가 돌면 다시 줄어든다. 이 방식은 한때 쓰던 segment stack 의 hot split 문제를 없애고 수십만 goroutine 을 작은 메모리로 돌릴 수 있게 해준다.
 
 ## 왜 이런 설계인가
-### 1. OS 스레드 vs Goroutine의 메모리 패러다임 차이
-전통적인 OS 스레드(예: Linux의 pthread)는 보통 1MB~8MB의 고정된 스택을 가집니다. 이는 커널 레벨에서 관리되며, 각 스레드는 이 메모리 공간을 확보해야 합니다. 만약 10만 개의 스레드를 생성한다면, 최소 100GB~800GB의 가상 메모리가 필요할 수 있습니다. (실제 물리 메모리 사용량은 적을 수 있지만, 가상 메모리 할당 오버헤드와 페이지 테이블 관리 비용이 큽니다.)
 
-Go의 goroutine은 이 접근법을 버렸습니다. Go 런타임은 자체적인 scheduler를 가지고 있으며, 이 scheduler는 수천 개의 goroutine을 수백 개의 OS 스레드(M)에 매핑합니다. 여기서 핵심은 **goroutine의 스택 크기를 런타임이 동적으로 제어**한다는 점입니다.
+운영체제가 thread 하나를 만들 때 기본으로 주는 stack 은 보통 1MB 정도다. 스레드 수백 개만 만들어도 수백 MB 를 stack 으로 점유한다. Go 는 동시성 흐름을 수만 개 이상 만드는 것을 주 사용처로 삼았기 때문에, 각 흐름에 1MB 씩 주는 방식은 처음부터 불가능했다. goroutine 당 시작 메모리를 극도로 작게 잡고, 실제로 깊은 호출이 필요한 goroutine 에만 큰 stack 을 나중에 할당하는 전략이 거의 유일한 답이었다.
 
-### 2. 세그먼트 스택을 버린 이유
-초기 Go 버전에서는 세그먼트 기반 스택(Segment Stack)을 사용하기도 했습니다. 즉, 스택이 여러 개의 작은 메모리 세그먼트로 연결된 리스트 형태였습니다. 이는 C/C++의 일부 구현에서 사용되던 방식입니다. 하지만 세그먼트 스택에는 단점이 있었습니다.
-1. **지연성(Latency)**: 새로운 세그먼트를 할당하고 연결하는 과정에서 추가적인 오버헤드가 발생했습니다.
-2. **호환성**: C 함수나 시스템 콜을 호출할 때, 연속된 스택을 기대하는 경우가 많았습니다. 세그먼트 스택을 사용할 경우 스택을 연속 메모리로 복사하는 비용이 발생했습니다.
-3. **단순성**: 단일 힙 블록을 관리하는 것이 여러 세그먼트를 관리하는 것보다 런타임 코드가 단순하고 예측 가능했습니다.
+초기 Go 는 stack 을 연결 리스트처럼 여러 segment 로 쪼개서 쓰는 방식이었다. 함수가 호출되어 현재 segment 가 부족하면 새 segment 를 할당해 이어 붙였다. 이 방식은 메모리를 아낄 수 있었지만, 특정 함수 호출 경계가 반복해서 segment 경계와 겹치면 매번 segment 할당과 해제가 일어나는 문제가 있었다. 이 문제는 흔히 hot split 이라고 불렸고, 실제 코드에서 갑자기 수십 배 느려지는 원인이 됐다.
 
-따라서 Go는 **연속 스택(Contiguous Stack)** 방식으로 전환했고, 이는 현재 Go의 기본 동작입니다.
+또한 segment 방식은 컴파일러가 만드는 코드가 segment 리스트를 따라가야 했고, C 언어의 alloca 류처럼 가변 크기 stack frame 을 다루기 어려웠다. 결국 Go 1.4 즈음에 segment stack 을 버리고 연속 stack(contiguous stack)으로 전환했다. 연속 stack 은 실제로 부족할 때 더 큰 메모리 블록을 새로 할당해 기존 stack 전체를 복사한다. 복사 비용은 들지만, 일반적인 코드에서는 한 goroutine 이 stack 을 커지는 횟수가 제한적이기 때문에 이 비용이 더 싸다.
 
-### 3. 2KB라는 숫자의 의미
-2KB는 OS의 페이지 크기(4KB)와 유사하지만, 초기 할당 크기를 최소화하기 위한 선택입니다.
-- **소수 함수**: 대부분의 함수는 몇몇 로컬 변수만 사용하며, 깊지 않은 호출 체인에서 종료됩니다. 2KB면 충분합니다.
-- **메모리 절약**: 10만 개의 goroutine이 2KB 스택을 가지면 총 200MB의 가상 메모리가 필요합니다. 이는 1MB 스택(100GB)에 비해 극히 작은 금액입니다.
-- **Lazy Allocation**: 실제로 스택이 필요할 때만 메모리를 할당합니다. 이를 **Lazy Allocation**이라고 합니다.
-
-### 4. 대안: 정적 스택 또는 큰 초기 스택
-만약 Go가 초기 스택을 1MB로 설정했다면, 간단한 웹 서버에서도 수백만 개의 goroutine이 생성될 때 메모리 부족 문제(OOM)가 발생했을 가능성이 높습니다. 반면, 2KB로 시작하면 메모리 사용량이 goroutine의 실제 필요에 따라 선형적으로 증가하므로, 고부하 상황에서도 더 많은 동시성을 수용할 수 있습니다.
+연속 stack 의 핵심 가정은 "대부분의 goroutine 은 얕은 stack 을 쓴다"이다. 2KB 시작 크기는 이 가정을 극단적으로 반영한다. 이 덕분에 100,000 개의 goroutine 을 만들어도 stack 초기 점유는 약 200MB 정도에 그친다. OS thread 100,000 개였다면 stack 만 100GB 가 필요하다. 실제로는 Go 런타임이 8KB 또는 16KB 의 배수로 할당하고, 시작 후 한 번이라도 커지면 2KB 낭비를 줄이기 위해 2KB 그대로 유지하지 않을 수 있지만, 규모의 차이는 여전하다.
 
 ## 어떻게 동작하는가
-### 1. 스택 구조와 할당
-Go의 goroutine 스택은 `runtime/stack.go` 파일에서 관리됩니다. 각 goroutine은 `g` 구조체에 스택 정보를 가지고 있으며, 이 정보는 `stack` 필드에 저장됩니다. 스택은 heap에서 할당된 연속 메모리 영역입니다.
 
-- **초기 상태**: goroutine이 생성되면, 런타임은 heap에서 작은 메모리 블록(2KB)을 할당합니다.
-- **스택 프론트(Stack Front)**: 스택의 시작 주소입니다.
-- **스택 백(Stack Back)**: 스택의 끝 주소입니다.
-- **스택 포인터(SP)**: 현재 스택의 바닥(bottom)을 가리키는 포인터입니다.
+goroutine 의 stack 상태는 runtime/stack.go 와 runtime/runtime2.go 에 정의된 `g` 구조체에 기록된다. `g.stack` 은 `stack` 구조체로 `lo` 와 `hi` 필드가 현재 stack 메모리 범위를 가리킨다. `g.stackguard0` 은 함수 프롤로그가 stack 부족을 검사할 때 비교하는 한계값이다. Go 컴파일러는 거의 모든 함수 시작 부분에 현재 stack pointer 와 `stackguard0` 을 비교하는 코드를 넣는다. 이 검사에서 stack 이 부족하다고 판정되면 `runtime.morestack` 이라는 런타임 함수로 점프한다.
 
-### 2. 스택 성장 (Stack Growth)
-호출이 깊어지면서 스택이 가득 차면, 런타임은 `morestack` 루틴을 호출합니다. 이 루틴은 다음과 같은 작업을 수행합니다.
-1. **새로운 더 큰 스택 할당**: 기존 스택 크기의 2배(또는 일정 크기 이상)인 새로운 메모리 블록을 heap에서 할당합니다.
-2. **데이터 복사**: 기존 스택에 있는 데이터(로컬 변수, 인자 등)를 새로운 스택으로 복사합니다.
-3. **포인터 조정**: 복사된 데이터 내부의 포인터들이 새로운 스택 주소를 가리하도록 조정합니다. 이를 **Pointer Adjustment** 또는 **Stack Scanning**이라고 합니다.
-4. **스위치**: 현재 goroutine의 스택 포인터를 새 스택으로 이동합니다.
-5. **이전 스택 해지**: 기존 스택은 해제됩니다(실제 물리 메모리 반환은 OS에 의해 지연될 수 있음).
+`morestack` 은 곧바로 새 stack 을 만들지 않고, 현재 goroutine 상태를 저장한 뒤 `runtime.newstack` 을 호출한다. `runtime/stack.go` 의 `newstack` 은 말 그대로 더 큰 stack 을 만들고 기존 stack 내용을 복사한다. 새 stack 크기는 `stackpool` 이나 `mcache` 같은 런타임 할당자에서 가져온다. 크기는 현재 사용량보다 넉넉하게 잡아 반복적인 복사를 줄인다. 큰 stack 이 필요할 때마다 약 2배씩 커지는 방식이 일반적이다.
 
-### 3. 스택 축소 (Stack Shrinking)
-goroutine이 긴 시간을 보내며 스택을 거의 사용하지 않으면, 런타임은 스택 크기를 줄일 수 있습니다. 이는 주로 `runtime/stack.go`의 `stackfree` 함수 등에서 처리되며, 스택 사용량이 일정 임계값 이하로 떨어질 때 발생합니다. 이를 통해 메모리 효율성을 유지합니다.
+복사가 일어날 때 가장 중요한 작업은 포인터 조정이다. 기존 stack 안에는 지역 변수, 함수 인자, 반환 주소, 또 다른 포인터들이 들어 있다. 이 포인터 중 heap 이나 다른 stack 을 가리키는 것은 새 stack 주소로 옮겨진 뒤에도 같은 대상 주소를 가리켜야 한다. 런타임은 pclntab(프로그램 카운터 라인 테이블)과 스택 맵(stack map)을 이용해 각 프레임에서 포인터가 들어 있는 위치를 찾고, `runtime.adjustpointers` 류 함수가 그 값을 보정한다. 이 과정이 틀리면 재귀 깊은 곳에서 heap 객체에 값을 썼는데 엉뚱한 메모리를 바꾸는 버그가 생긴다.
 
-### 4. write barrier와의 관계
-스택이 복사될 때, GC(Garbage Collector)는 write barrier를 통해 포인터 변경을 추적합니다. 이는 새로운 스택으로의 복사 과정에서 GC가 heap 객체를 추적할 때 일관성을 유지하기 위함입니다.
+stack 축소는 함수가 반환해서 남는 공간이 많아져도 바로 일어나지 않는다. stack shrink 는 GC 사이클 중에 goroutine 을 스캔할 때 실행된다. 런타임은 stack 사용량을 검사해 사용하지 않는 꼬리 부분이 충분히 크면 stack 을 더 작은 메모리로 복사하고 `g.stack` 정보를 갱신한다. 그래서 "재귀가 끝났는데 메모리가 즉시 안 줄어든다"는 현상은 버그가 아니라 설계 동작이다. GC 를 강제로 돌리면 줄어드는 것을 확인할 수 있다.
+
+`runtime.Stack` 함수는 현재 goroutine 의 stack trace 텍스트를 돌려준다. 이 함수가 돌려주는 바이트 수는 stack 메모리 크기가 아니라 trace 문자열 길이다. 이 예제의 `traceLenAtDepth` 는 그 차이를 보여주기 위해 일부러 사용한다. 실제 stack 메모리 크기는 `runtime.MemStats.StackInuse` 로 전역 합계를 관찰할 수 있다. 특정 goroutine 하나의 stack 크기를 공개 API 로 직접 읽는 방법은 없고, 런타임 내부에서는 `g.stack.hi - g.stack.lo` 로 계산한다.
 
 ## 돌려보기
-이 디렉토리에서 그대로 실행할 수 있는 명령을 순서대로.
 
 ```bash
-go vet ./...                 # 정적 검사: 타입 안전성 확인
-go build -o /dev/null ./...  # 컴파일 확인: 코드 구조 확인
-go run .                     # 시연 실행: 스택 동작 관찰
-go test -v ./...             # 테스트: 스택 성장 및 메모리 효율성 검증
-go test -race ./...          # 동시성 주제라면 반드시: race condition 확인
+go vet ./...                 # 정적 검사. noinline 지시어와 포인터 사용을 확인합니다.
+go build -o /dev/null ./...  # 표준 라이브러리만 사용해 macOS/리눅스에서 컴파일되는지 확인합니다.
+go run .                     # stack 성장, 축소, hot split 시뮬레이션, 메모리 이점을 순서대로 출력합니다.
+go test -v ./...             # 포인터 무결성, trace 길이, 많은 goroutine 메모리 상한을 검증합니다.
+go test -race ./...          # 동시성 코드가 race 를 일으키지 않는지 확인합니다.
 ```
 
-각 명령에서 무엇을 봐야 하는지:
-- `go vet ./...`: 타입 오류나 잠재적 버그가 없는지 확인.
-- `go build -o /dev/null ./...`: 컴파일이 성공하면 코드 구조가 맞음.
-- `go run .`: 기본 goroutine의 스택 성장, 큰 스택 할당, 다수 goroutine 생성 시 메모리 사용량을 확인.
-- `go test -v ./...`: 테스트 통과 여부 및 로그 출력으로 스택 동작 검증.
-- `go test -race ./...`: 동시성 코드에서 race condition이 없는지 확인.
+`go run .` 출력에서 `StackInuse` 수치가 깊은 재귀 goroutine 대기 중 증가하고, `재귀 반환 + GC 후` 줄어드는지 봐야 한다. `go test -v` 는 시간 단정이 아니라 포인터 값, trace 길이, 메모리 상한 같은 불변식을 검증한다. `go test -race` 는 채널로 대기하는 깊은 재귀 goroutine 과 main goroutine 사이의 동기화가 올바른지 확인한다.
 
 ## 코드로 확인하기
-### main.go 출력 해석
-- **Default Behavior**: `Recurion depth reached: 10000` (또는 그 이상)과 같은 출력이 나옵니다. 이는 스택이 2KB에서 시작하더라도 자동으로 성장하여 10000深度的 재귀 호출을 처리할 수 있음을 의미합니다. 스택이 고정되어 작다면 이 깊이에서 panic이 발생했을 것입니다.
-- **Large Stack Allocation**: `Allocated 1MB array on stack. Stack size grew to > 1MB.`와 같은 출력이 나옵니다. 함수 내부의 큰 배열이 스택에 할당되어 스택 크기가 커졌음을 보여줍니다. 이는 스택이 동적으로 성장함을 확인합니다.
-- **Massive Goroutine Count**: `Created and finished 100000 goroutines.`와 함께 `Heap Alloc: ...` 출력이 나옵니다. 10만 개의 goroutine이 생성되어도 Heap Alloc이 크게 증가하지 않습니다. 이는 스택 메모리가 Heap Alloc에 포함되지 않으며, 각 goroutine이 작은 스택을 가짐을 의미합니다.
 
-### main_test.go 검증 내용
-- **TestDefaultStackGrowth**: 재귀 호출이 panic 없이 일정 깊이까지 완료되는지 확인. 스택 자동 성장 메커니즘이 작동함을 검증.
-- **TestLargeStackAllocationOnStack**: 큰 배열 할당이 panic 없이 완료되는지 확인. 스택 크기가 커지는 것을 간접적으로 검증.
-- **BenchmarkGoroutineCreationOverhead**: 많은 goroutine 생성 시 오버헤드가 적음을 간접적으로 확인.
-- **TestGoroutineMemoryEfficiency**: 많은 goroutine 생성 시 Heap Alloc이 크게 증가하지 않음을 확인. 스택이 Heap과 분리되어 관리됨을 검증.
+`showStackGrowth` 는 두 가지를 출력한다. 첫째는 `traceLenAtDepth(0)` 과 `traceLenAtDepth(200)` 의 비교다. 깊이 0 에서는 런타임이 main 함수 몇 개만 나열하지만, 깊이 200 에서는 200 개의 `traceLenAtDepth` 프레임이 trace 에 들어가므로 텍스트 길이가 크게 늘어난다. 이것은 stack 메모리 크기가 아니라 프레임 수가 늘었다는 증거다. 둘째는 `deepRecursionThenBlock` 으로 2,048 프레임을 쌓은 goroutine 을 블록 상태로 둔 뒤 `runtime.MemStats.StackInuse` 를 읽는 부분이다. 깊이 2,048 에 각 512바이트 padding 이 있으므로 약 1MB 의 stack 사용이 생긴다. 시작 stack 이 2KB 였다면 이 지점에서 몇 번의 morestack 복사가 이미 일어난 상태다.
+
+`showStackCopy` 는 `fillStack` 을 여러 깊이로 호출하고 heap 객체 `target.value` 가 42 로 남아 있는지 확인한다. 각 재귀 프레임은 `ctx *pointerTarget` 을 인자로 들고 있다. stack 이 자라면서 복사될 때 런타임이 이 인자 포인터를 새 stack 주소로 조정해야 한다. 조정이 실패하면 depth 0 에서 `ctx.value = 42` 가 과거 stack 을 가리켜 잘못된 메모리 접근이 되거나 test 가 실패한다. 이 코드는 실제로 `go test -race` 에서도 안전하게 통과한다.
+
+`simulateHotSplit` 은 `//go:noinline` 이 붙은 아주 작은 함수를 백만 번 호출해 시간을 잰다. 연속 stack 에서는 함수 호출이 단순히 stack pointer 를 옮기고 반환 주소를 저장하는 정도다. segment stack 시절에는 이 경계에서 segment 할당과 해제가 반복될 수 있었다. 시뮬레이션 자체는 지금 Go 에서 segment 오버헤드를 재현하지 않지만, 아주 작은 함수 호출이 충분히 빠르다는 것을 수치로 보여준다.
+
+`manyGoroutines` 는 100,000 개 goroutine 을 만들고 `StackInuse` 를 출력한다. 각 goroutine 은 거의 stack 을 쓰지 않으므로 시작 크기 2KB 수준을 유지한다. 출력에서 `StackInuse` 는 대략 200~300MB 근처가 된다. 같은 개수를 OS thread 로 만들면 1MB x 100,000 = 약 100GB 가 필요하다는 비교를 출력에 넣었다. 이는 goroutine 의 가벼움을 막연한 비유가 아니라 stack 정책에서 오는 구체적 수치로 보여준다.
+
+`main_test.go` 의 `TestDeepRecursionPointerIntegrity` 는 깊이를 점점 늘리며 `fillStack` 이 `target.value` 를 항상 42 로 만드는지 확인한다. `TestTraceLenGrowsWithDepth` 는 재귀 깊이가 늘면 `runtime.Stack` trace 길이가 늘어나는지 확인한다. `TestManyGoroutinesMemoryUsage` 는 5,000 개 goroutine 의 stack 총합이 1GB 를 넘지 않는지 확인한다. 만약 goroutine 하나가 1MB 씩 stack 을 썼다면 5GB 가 되어 이 테스트는 반드시 실패한다. `BenchmarkFillStack` 과 `BenchmarkSimulateBoundaryCrossing` 은 stack 성장 복사 비용과 작은 함수 호출 비용을 측정한다.
 
 ## 모르면 겪는 일
-### 1. 스택 오버플로우 (Stack Overflow)
-스택이 작게 시작한다는 것을 모르고, 함수 내에서 큰 배열을 할당하거나 깊은 재귀 호출을 사용하면, 스택이 빠르게 차서 `fatal error: stack overflow`가 발생할 수 있습니다. 특히 재귀 알고리즘을 사용할 때 스택 깊이를 고려하지 않으면 이 문제가 빈번하게 발생합니다.
 
-### 2. 메모리 부족 (OOM)
-스택이 동적으로 성장한다는 것을 모르고, 많은 goroutine을 생성할 때 메모리 사용량을 잘못 추정하면 OOM이 발생할 수 있습니다. 반대로, 스택이 고정적으로 크다고 알고 있으면 메모리를 비효율적으로 사용한다고 판단할 수 있습니다.
+첫 번째 사고는 재귀가 조금만 깊어도 stack overflow 로 보이는 panic 을 보고 "goroutine 은 스택이 2KB 밖에 없다"고 오해하는 것이다. 실제로는 morestack 이 자동으로 stack 을 키우므로 일반적인 재귀에서는 stack overflow 가 잘 나지 않는다. 다만 정말 무한 재귀를 하면 결국 1GB 근처까지 자라다가 `runtime: goroutine stack exceeds 1000000000-byte limit` 같은 fatal error 가 난다. 이때 stack 이 자랐다가 줄어드는 과정을 모르면 원인을 추적하기 어렵다.
 
-### 3. 성능 저하 (Performance Degradation)
-스택 성장 과정에서의 복사 작업으로 인해 성능 저하가 발생할 수 있습니다. 깊은 재귀 호출이나 큰 로컬 변수를 가진 함수는 스택이 여러 번 성장하며 복사되므로, 호출 오버헤드가 증가합니다. 이를 최적화하기 위해 재귀를 반복 구조로 변경하거나, 큰 변수를 힙에 할당하는 것이 좋습니다.
+두 번째는 segment stack 시절에 나온 옛 자료를 보고 "Go stack 은 연결 리스트"라고 기억하는 경우다. 지금은 연속 stack 이므로 stack 주소가 연속된 범위에 있다. 이걸 모르고 포인터 연산으로 stack 주소를 비교하거나, stack 주소가 조각나 있다고 가정하는 로우레벨 코드를 짜면 잘못된 판단을 한다. 예를 들어 stack 변수 두 개의 주소 차이가 크다고 해서 그 사이가 전부 유효한 stack 이라고 가정하면 안 된다.
+
+세 번째는 stack 복사가 포인터를 조정한다는 사실을 모른 채 unsafe 를 쓰는 경우다. 예를 들어 stack 에 있는 변수의 주소를 `uintptr` 로 변환해 heap 객체 어딘가에 저장해 두고, 그 뒤 깊은 재귀를 호출하면 런타입은 그 `uintptr` 값이 포인터인지 알 수 없어 조정하지 못한다. 나중에 그 주소를 참조하면 변경된 stack 주소가 아니라 옛 주소를 보게 되어, 값이 사라지거나 프로그램이 죽는다. 이런 버그는 보통 재귀 깊이가 특정 임계를 넘을 때만 나타나기 때문에 재현이 매우 어렵다.
+
+네 번째는 stack shrink 시점을 모르고 메모리 프로파일을 오해하는 경우다. 깊은 재귀를 빠져나왔는데도 `StackInuse` 나 pprof 의 stack 메모리가 줄어들지 않아 보인다. GC 를 돌리기 전까지는 stack 이 유지되기 때문이다. 이걸 모르고 코어 덤프를 뜯으면 "메모리 누수"로 오진하게 된다. 특히 p99 지연 시간이 GC 주기마다 튀는데 CPU 프로파일에는 stack 복사 비용이 잘 안 잡히는 경우가 있다. stack 복사는 짧은 순간에 일어나므로 CPU 프로파일보다 실행 시간 히스토그램에서 더 잘 보인다.
 
 ## 언제 신경 쓰고 언제 무시하나
-### 신경 써야 하는 경우
-- **깊은 재귀 호출**: 스택이 빠르게 차므로, 재귀 깊이를 제한하거나 반복 구조로 변경해야 합니다.
-- **큰 로컬 변수**: 함수 내부에 큰 배열이나 구조체를 사용하면 스택이 커지므로, 힙에 할당하는 것이 좋을 수 있습니다.
-- **수십만 개의 goroutine**: 메모리 사용량을 정확히 추정하려면 스택 초기 크기와 성장 패턴을 이해해야 합니다.
 
-### 무시해도 되는 경우
-- **단순한 함수 호출**: 대부분의 함수는 스택을 거의 사용하지 않으므로, 스택 크기를 신경 쓸 필요가 없습니다.
-- **소규모 애플리케이션**: goroutine 수가 적으면 스택 크기 문제가 발생하기 어렵습니다.
+goroutine stack 은 대부분의 애플리케이션 코드에서 신경 쓸 필요가 없다. 함수 호출이 깊어도 런타임이 알아서 키우고, GC 가 알아서 줄인다. 2KB 시작이 부담되는 곳은 stack 을 실제로 많이 쓰는 워크로드, 예를 들어 XML 이나 JSON 을 깊은 재귀로 파싱하는 코드, 복잡한 AST 를 다루는 컴파일러류 코드다. 이런 곳에서는 stack 복사가 여러 번 일어날 수 있고, 더 큰 초기 stack 을 갖는 OS thread 가 아니라 goroutine 을 쓰면서 추가로 얻는 메모리 절약이 제한적일 수 있다.
+
+이 지식이 중요한 규모는 goroutine 수가 수만 개를 넘거나, 재귀 깊이가 수천을 넘을 때다. 그 전에는 "goroutine 은 가벼우니까 많이 만들어도 된다" 정도의 직관으로 충분하다. 일부러 `GOMAXPROCS` 를 바꾸거나 stack 크기를 조정하려고 하지 않는 편이 낫다. Go 런타임은 stack 초기 크기를 사용자가 설정하는 공식적인 플래그를 제공하지 않으며, 억지로 바꾸면 오히려 메모리 사용량만 늘어난다.
+
+unsafe 로 stack 주소를 다룰 때는 이 지식이 필수다. `runtime.KeepAlive`, `unsafe.Pointer` 와 `uintptr` 의 차이, stack 복사에서 포인터 조정이 되지 않는 경우를 정확히 알아야 한다. 이런 코드는 주로 syscall 이나 CGO 경계에서 나오는데, 학습용이 아니라면 작성하지 않는 것이 최선이다. 만약 작성해야 한다면 `go vet` 의 unsafe 경고와 `-race` 를 반드시 통과시켜야 한다.
 
 ## 더 파보기
-1. [Go Source Code: runtime/stack.go](https://go.googlesource.com/go/+/refs/tags/go1.21.0/src/runtime/stack.go) - 스택 관리의 핵심 소스 코드
-2. [Effective Go: Goroutines](https://go.dev/doc/effective_go#goroutines) - Goroutine 사용 가이드
-3. [Go Blog: Go Schedulers](https://go.dev/blog/goscheduler) - Go Scheduler와 Goroutine 매핑 설명
 
-이 자료는 Go의 goroutine 스택이 2KB에서 시작하여 동적으로 성장한다는 점을 강조합니다. 이를 이해하면 메모리 효율적인 Goroutine 사용과 스택 오버플로우 방지에 도움이 됩니다.
+- `runtime/stack.go` — `newstack`, `copystack`, `shrinkstack`, `adjustpointers` 의 실제 구현
+- `runtime/runtime2.go` — `g` 구조체의 `stack`, `stackguard0` 필드 정의
+- Go 언어 블로그 "The Go Memory Model" 과 "The Go scheduler" — goroutine stack 과 스케줄러의 관계
+- Go 1.4 release notes 중 "Continuing the cleanup of the runtime" — segment stack 폐기와 연속 stack 전환 배경
+- `runtime/stack_test.go` — stack 성장, 복사, shrink 를 검증하는 런타임 테스트
+- `go test -gcflags="-m"` — 어떤 함수가 인라인되는지, stack escape analysis 결과를 보는 방법
