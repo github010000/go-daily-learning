@@ -1,44 +1,62 @@
 package main
 
 import (
-    "runtime"
-    "testing"
+	"runtime"
+	"testing"
 )
 
-// TestParkNetworkReadsParksGoroutines는 network read에서 기다리는 goroutine이
-// 실제로 netpoller에 park되는지 스택 트레이스로 검증한다.
-// sleep 같은 시간 기반 대기를 쓰지 않아 부하가 높은 CI에서도 안정적이다.
-func TestParkNetworkReadsParksGoroutines(t *testing.T) {
-    old := runtime.GOMAXPROCS(1)
-    defer runtime.GOMAXPROCS(old)
-
-    demo, err := parkNetworkReads(3)
-    if err != nil {
-        t.Fatalf("parkNetworkReads failed: %v", err)
-    }
-    defer demo.close()
-
-    got := countStackNeedle("internal/poll.(*FD).Read")
-    if got < 3 {
-        t.Errorf("expected at least 3 goroutines parked in internal/poll.(*FD).Read, got %d", got)
-    }
+// TestBlockOnNetpollDoesNotLeakGoroutines 는 netpoller 경로로 블로킹된
+// goroutine 들이 연결을 닫았을 때 모두 깨어나고, 함수 반환 후 goroutine 수가
+// 원래 수준으로 돌아오는지 검증한다. settle 을 0 으로 두어 시간에 의존하지 않는다.
+func TestBlockOnNetpollDoesNotLeakGoroutines(t *testing.T) {
+	before := runtime.NumGoroutine()
+	blockOnNetpoll(10, 0)
+	runtime.Gosched()
+	after := runtime.NumGoroutine()
+	if after > before+2 {
+		t.Fatalf("netpoll 이후 goroutine 누수: before=%d after=%d", before, after)
+	}
 }
 
-// TestCPUMakesProgressWhileNetworkReadsAreParked는 net.Conn.Read가 goroutine만
-// 재우고 M을 살려두는지 확인한다. GOMAXPROCS=1로 고정한 뒤 CPU worker가 목표까지
-// 도달하는지 검증한다. 시간 단정 없이 조건 충족까지 runtime.Gosched로 양보한다.
-func TestCPUMakesProgressWhileNetworkReadsAreParked(t *testing.T) {
-    old := runtime.GOMAXPROCS(1)
-    defer runtime.GOMAXPROCS(old)
+// TestBlockOnRawSyscallPipeDoesNotLeakGoroutines 는 netpoller 를 타지 않는
+// raw syscall.Read 경로도 쓰기로 해제하면 goroutine 이 모두 반환되는지 검증한다.
+// 여기서도 시간 단정은 사용하지 않고 WaitGroup 수거 후 개수만 본다.
+func TestBlockOnRawSyscallPipeDoesNotLeakGoroutines(t *testing.T) {
+	before := runtime.NumGoroutine()
+	blockOnRawSyscallPipe(10, 0)
+	runtime.Gosched()
+	after := runtime.NumGoroutine()
+	if after > before+2 {
+		t.Fatalf("raw syscall 이후 goroutine 누수: before=%d after=%d", before, after)
+	}
+}
 
-    demo, err := parkNetworkReads(3)
-    if err != nil {
-        t.Fatalf("parkNetworkReads failed: %v", err)
-    }
-    defer demo.close()
+// TestCurrentThreadsReadsProcStatus 는 /proc/self/status 가 있는 리눅스 환경에서
+// 스레드 수를 0 보다 크게 읽어야 한다는 것을 검증한다. /proc 이 없으면 건너뛴다.
+func TestCurrentThreadsReadsProcStatus(t *testing.T) {
+	n := currentThreads()
+	if n == 0 {
+		t.Fatal("스레드 수가 0으로 읽힘")
+	}
+	if n == -1 {
+		t.Skip("/proc/self/status 를 읽을 수 없어 스킵")
+	}
+}
 
-    got := runCPUWorkUntilTarget(1000)
-    if got < 1000 {
-        t.Errorf("expected CPU work target 1000, got %d", got)
-    }
+// BenchmarkBlockOnNetpoll 은 netpoller 경로의 setup/teardown 전체를 상대 비교용으로 측정한다.
+func BenchmarkBlockOnNetpoll(b *testing.B) {
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		blockOnNetpoll(10, 0)
+	}
+}
+
+// BenchmarkBlockOnRawSyscallPipe 는 raw syscall 경로의 setup/teardown 전체를 측정한다.
+func BenchmarkBlockOnRawSyscallPipe(b *testing.B) {
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		blockOnRawSyscallPipe(10, 0)
+	}
 }
